@@ -1,0 +1,21 @@
+---
+# acme-api ships no SELinux policy. Without one it would run as unconfined_service_t
+# (enforcing, but unconfined). For PCI scope we confine it with a custom module.
+selinux_modules:
+  - name: acme_api
+    src: "{{ ansible_config_file | dirname }}/policy/acme_api"   # not inventory_dir: EDA runs from a temp copy
+    relabel: [/opt/acme/api, /etc/acme, /var/log/acme, /run/acme]   # labelled by acme_api.fc
+    restart: [acme-api]                                  # pick up the new domain
+# Labels for the app's own paths live in the module's acme_api.fc, so no local
+# fcontext rules are needed - only a relabel after the module is loaded.
+selinux_fcontexts: []
+selinux_restorecon_paths: [/opt/acme/api, /etc/acme, /var/log/acme, /run/acme]  # drift: re-assert labels every run
+selinux_ports:
+  - {ports: "{{ acme_api_port }}", proto: tcp, setype: acme_api_port_t}    # type comes from our module
+  - {ports: "{{ acme_db_port }}", proto: tcp, setype: postgresql_port_t}  # outbound DB connection
+selinux_booleans: []
+# Put "acme_api_t" here while tuning a new module version: only that domain is permissive.
+selinux_permissive_domains: []
+
+acme_health_checks:
+  - {name: "API health (app -> db)", url: "http://127.0.0.1:{{ acme_api_port }}/health"}

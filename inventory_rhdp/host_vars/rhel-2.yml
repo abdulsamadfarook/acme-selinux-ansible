@@ -1,0 +1,18 @@
+---
+# rhel-2 is in both "app" and "db". When two groups set the same variable, Ansible
+# does not merge them: the later group (db, alphabetically) simply wins, and the app's
+# port 8282 and health check would be lost. So the combined values are set here.
+selinux_ports:
+  - {ports: "{{ acme_api_port }}", proto: tcp, setype: acme_api_port_t}   # app: acme-api binds
+  - {ports: "{{ acme_db_port }}", proto: tcp, setype: postgresql_port_t}  # app connects + db binds
+acme_health_checks:
+  - {name: "API health (app -> db)", url: "http://127.0.0.1:{{ acme_api_port }}/health"}
+# The app's module (same as group_vars/app) plus the platform noise fix. Lists are
+# not merged across groups/hosts, so the full list is repeated here.
+selinux_modules:
+  - name: acme_api
+    src: "{{ ansible_config_file | dirname }}/policy/acme_api"
+    relabel: [/opt/acme/api, /etc/acme, /var/log/acme, /run/acme]
+    restart: [acme-api]
+  - name: qemu_ga_noise   # dontaudit only, see policy/qemu_ga_noise/qemu_ga_noise.te
+    src: "{{ ansible_config_file | dirname }}/policy/qemu_ga_noise"

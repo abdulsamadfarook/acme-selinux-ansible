@@ -1,0 +1,13 @@
+---
+# Where compiled custom modules are built on the target
+selinux_module_build_dir: /var/lib/acme-selinux/modules
+# Marker written after every successful policy run; the enforcement gate only
+# counts denials that happened AFTER this time.
+selinux_policy_marker: /var/lib/acme-selinux/policy_applied
+# Identity of the declared policy (module sources are covered by their own sha checks)
+selinux_policy_fingerprint: >-
+  {{ [selinux_fcontexts, selinux_ports, selinux_booleans, selinux_modules | map(attribute='name') | list,
+      selinux_permissive_domains] | to_json | hash('sha256') }}
+# Restart the enforcement-gate observation window on purpose (e.g. after a denial was
+# investigated and fixed outside a policy change). Shows up in the job log.
+selinux_policy_reset_window: false

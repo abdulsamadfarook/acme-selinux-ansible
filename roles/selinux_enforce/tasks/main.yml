@@ -1,0 +1,192 @@
+---
+# Permissive -> Enforcing for ONE host, safely:
+#   1. pre-flight gate  - policy current, no denials since it was applied, app healthy
+#   2. runtime switch   - setenforce 1 (no reboot, no service restart = no downtime)
+#   3. soak + verify    - health checks and "no new denials" for selinux_soak_seconds
+#   4. persist          - /etc/selinux/config only after the host proved itself
+#   rescue              - setenforce 0 within seconds, evidence captured, rollout halted
+
+- name: Read SELinux state
+  ansible.builtin.command: getenforce
+  register: selinux_before
+  changed_when: false
+  check_mode: false
+
+- name: Fail if disabled (must go through the relabel path first)
+  ansible.builtin.assert:
+    that: selinux_before.stdout != 'Disabled'
+    fail_msg: "{{ inventory_hostname }} is Disabled - run playbooks/selinux_from_disabled.yml first."
+
+# ------------------------------------------------------------------ 1. gate
+- name: Pre-flight gate
+  when: selinux_before.stdout == 'Permissive'
+  block:
+    - name: Read policy marker
+      ansible.builtin.slurp:
+        src: "{{ selinux_policy_marker }}"
+      register: selinux_marker
+
+    - name: Policy marker
+      ansible.builtin.set_fact:
+        selinux_policy_applied_at: "{{ (selinux_marker.content | b64decode | from_json).applied_at }}"
+
+    - name: Host clock (epoch) - all comparisons use the target's own clock
+      ansible.builtin.command: date +%s
+      register: selinux_enforce_host_now
+      changed_when: false
+      check_mode: false
+
+    - name: Sanity - marker must not be in the host's future (clock skew makes the gate blind)
+      ansible.builtin.assert:
+        that: selinux_policy_applied_at | int <= selinux_enforce_host_now.stdout | int + 60
+        fail_msg: >-
+          Policy marker ({{ selinux_policy_applied_at }}) is ahead of the host clock
+          ({{ selinux_enforce_host_now.stdout }}). Fix time sync (chronyc makestep) and
+          re-run selinux_policy.yml before enforcing.
+
+    - name: Exercise the application (synthetic traffic before counting)
+      ansible.builtin.uri:
+        url: "{{ item.url }}"
+        status_code: 200
+      loop: "{{ acme_health_checks }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Count denials logged since the current policy was applied
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        LC_ALL=C ausearch --input-logs -m AVC,USER_AVC,SELINUX_ERR
+        -ts $(LC_ALL=C date -d @{{ selinux_policy_applied_at }} '+%x %T') --raw 2>/dev/null
+        | grep -c 'denied\|SELINUX_ERR' || true
+      register: selinux_gate_count
+      changed_when: false
+      check_mode: false
+
+    - name: Gate - would anything break under enforcing?
+      ansible.builtin.assert:
+        that: selinux_gate_count.stdout | int <= selinux_gate_max_denials or selinux_gate_override | bool
+        fail_msg: >-
+          {{ selinux_gate_count.stdout }} denial(s) since the policy was applied
+          ({{ '%Y-%m-%d %H:%M:%S' | strftime(selinux_policy_applied_at | int) }}). Not enforcing.
+          Run playbooks/selinux_audit.yml (window defaults to "since policy applied") and fix the policy first.
+        success_msg: "Gate passed: {{ selinux_gate_count.stdout }} denials since policy applied."
+
+# ------------------------------------------------------------------ 2-4. switch
+- name: Switch to enforcing with automatic rollback
+  when: selinux_before.stdout == 'Permissive'
+  block:
+    - name: Remember switch time (host clock)
+      ansible.builtin.command: date +%s
+      register: selinux_switch_clock
+      changed_when: false
+
+    - name: Switch time
+      ansible.builtin.set_fact:
+        selinux_switch_at: "{{ selinux_switch_clock.stdout }}"
+
+    - name: Runtime switch (setenforce 1) - no reboot, no restart
+      ansible.builtin.command: setenforce 1
+      changed_when: true
+
+    # Fast-fail soak: every second, probe the health URLs AND look for real denials.
+    # The first failure aborts -> rescue rolls back. (A first version slept for the
+    # whole soak before checking: the lab measured 30 s of 503s on a bad canary.)
+    - name: Soak with fast-fail probing
+      ansible.builtin.shell: |
+        set -o pipefail
+        since=$(LC_ALL=C date -d @{{ selinux_switch_at }} '+%x %T')
+        for i in $(seq {{ selinux_soak_seconds }}); do
+        {% for c in acme_health_checks %}
+          code=$(curl -s -m 2 -o /dev/null -w '%{http_code}' '{{ c.url }}')
+          [ "$code" = 200 ] || { echo "t+${i}s {{ c.name }} -> HTTP $code"; exit 1; }
+        {% endfor %}
+        {% if acme_db_health_cmd is defined %}
+          {{ acme_db_health_cmd }} >/dev/null || { echo "t+${i}s db health failed"; exit 1; }
+        {% endif %}
+          n=$(ausearch --input-logs -m AVC,USER_AVC,SELINUX_ERR -ts $since --raw 2>/dev/null | grep -c 'denied\|SELINUX_ERR' || true)
+          [ "$n" -eq 0 ] || { echo "t+${i}s $n real denial(s) since switch"; exit 1; }
+          sleep 1
+        done
+        echo "soak passed: {{ selinux_soak_seconds }} s, all checks green, 0 denials"
+      register: selinux_soak
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Soak result
+      ansible.builtin.debug:
+        msg: "{{ selinux_soak.stdout | default('skipped in check mode') }}"
+
+    - name: Persist enforcing in /etc/selinux/config
+      ansible.posix.selinux:
+        policy: "{{ selinux_policy }}"
+        state: enforcing
+
+  rescue:
+    - name: ROLLBACK - back to permissive immediately
+      ansible.builtin.command: setenforce 0
+      changed_when: true
+
+    - name: Capture the denials that caused the rollback
+      ansible.builtin.shell: >-
+        LC_ALL=C ausearch --input-logs -m AVC,USER_AVC,SELINUX_ERR -i
+        -ts $(LC_ALL=C date -d @{{ selinux_switch_at }} '+%x %T') 2>/dev/null || true
+      register: selinux_rollback_evidence
+      changed_when: false
+
+    - name: Evidence directory on the controller (reports/ is not in Git)
+      ansible.builtin.file:
+        path: "{{ selinux_report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Save evidence on the controller
+      ansible.builtin.copy:
+        dest: "{{ selinux_report_dir }}/rollback_{{ inventory_hostname }}_{{ selinux_switch_at }}.log"
+        content: "{{ selinux_rollback_evidence.stdout }}\n"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+
+    - name: Halt the rollout
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} failed under enforcing ({{ selinux_soak.stdout | default(ansible_failed_result.msg | default('see log')) }})
+          and was rolled back to permissive.
+          Evidence: reports/rollback_{{ inventory_hostname }}_{{ selinux_switch_at }}.log.
+          max_fail_percentage=0 stops the remaining batches.
+
+# Already enforcing: just make sure config and kernel cmdline agree (idempotent)
+- name: Persist enforcing in /etc/selinux/config
+  ansible.posix.selinux:
+    policy: "{{ selinux_policy }}"
+    state: enforcing
+  when: selinux_before.stdout == 'Enforcing'
+
+- name: Look for kernel arguments that would override the config at next boot
+  ansible.builtin.shell: set -o pipefail; grubby --info=ALL | grep -E '^args=.*(selinux=0|enforcing=0)' || true
+  register: selinux_bad_kargs
+  changed_when: false
+  check_mode: false
+
+- name: Remove selinux=0 / enforcing=0 from all boot entries
+  ansible.builtin.command: grubby --update-kernel=ALL --remove-args="selinux enforcing"
+  when: selinux_bad_kargs.stdout | length > 0
+  changed_when: true
+
+# Reached only when the host is enforcing and stayed healthy (a failed soak ends in
+# the rescue above). Drift enforces the mode only on hosts with this marker, so a
+# host that has not been through the gate yet is never switched by drift or EDA.
+- name: State directory
+  ansible.builtin.file:
+    path: "{{ selinux_enforced_marker | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Mark this host as migrated to enforcing
+  ansible.builtin.copy:
+    dest: "{{ selinux_enforced_marker }}"
+    content: "enforced by the selinux_enforce role at {{ now(utc=true).isoformat() }}\n"
+    mode: "0644"
+    force: false   # keep the first date; re-runs are not a change

@@ -1,0 +1,80 @@
+policy_module(acme_api, 1.0.1)
+
+########################################
+#
+# Declarations
+#
+# Domain the service runs in, and the label on its executable (the "entrypoint").
+# init_daemon_domain() = "when systemd executes a file of type acme_api_exec_t,
+# the new process transitions into acme_api_t".
+type acme_api_t;
+type acme_api_exec_t;
+init_daemon_domain(acme_api_t, acme_api_exec_t)
+
+# Its own config, logs, runtime (socket) directory and TCP port
+type acme_api_conf_t;
+files_config_file(acme_api_conf_t)
+
+type acme_api_log_t;
+logging_log_file(acme_api_log_t)
+
+type acme_api_var_run_t;
+files_pid_file(acme_api_var_run_t)
+
+type acme_api_port_t;
+corenet_port(acme_api_port_t)
+
+########################################
+#
+# acme_api local policy - only what the service needs
+#
+allow acme_api_t self:process { fork signal_perms };
+allow acme_api_t self:fifo_file rw_fifo_file_perms;
+allow acme_api_t self:unix_stream_socket create_stream_socket_perms;
+allow acme_api_t self:tcp_socket create_stream_socket_perms;
+
+# Config: read only
+read_files_pattern(acme_api_t, acme_api_conf_t, acme_api_conf_t)
+list_dirs_pattern(acme_api_t, acme_api_conf_t, acme_api_conf_t)
+
+# Logs: append/create inside its own log dir only
+manage_dirs_pattern(acme_api_t, acme_api_log_t, acme_api_log_t)
+append_files_pattern(acme_api_t, acme_api_log_t, acme_api_log_t)
+create_files_pattern(acme_api_t, acme_api_log_t, acme_api_log_t)
+logging_search_logs(acme_api_t)
+
+# Runtime dir: dynamic socket names (admin-<pid>.sock) are covered because new
+# sockets inherit acme_api_var_run_t from the directory they are created in.
+manage_dirs_pattern(acme_api_t, acme_api_var_run_t, acme_api_var_run_t)
+manage_sock_files_pattern(acme_api_t, acme_api_var_run_t, acme_api_var_run_t)
+files_search_pids(acme_api_t)
+
+# Network: listen on its own port, talk to PostgreSQL - nothing else
+corenet_tcp_bind_generic_node(acme_api_t)
+allow acme_api_t acme_api_port_t:tcp_socket name_bind;
+corenet_tcp_connect_postgresql_port(acme_api_t)
+
+# Python's socket layer reads /proc/net and /proc/sys/net  (added in 1.0.1 from AVCs
+# collected with acme_api_t as a permissive domain)
+kernel_read_network_state(acme_api_t)
+kernel_read_network_state_symlinks(acme_api_t)
+kernel_read_net_sysctls(acme_api_t)
+
+# libpq probes for a Kerberos keytab; the app does not use Kerberos, so silence the
+# probe instead of allowing it (dontaudit = deny without logging)  (1.0.1)
+gen_require(`
+	type krb5_keytab_t;
+')
+dontaudit acme_api_t krb5_keytab_t:dir search;
+
+# Python runtime
+corecmd_exec_bin(acme_api_t)
+corecmd_search_bin(acme_api_t)
+libs_use_ld_so(acme_api_t)
+libs_use_shared_libs(acme_api_t)
+files_read_usr_files(acme_api_t)
+miscfiles_read_localization(acme_api_t)
+kernel_read_system_state(acme_api_t)
+dev_read_urand(acme_api_t)
+sysnet_dns_name_resolve(acme_api_t)
+auth_use_nsswitch(acme_api_t)

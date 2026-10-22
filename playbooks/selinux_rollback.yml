@@ -1,0 +1,37 @@
+---
+# Break-glass: put hosts back to PERMISSIVE (never disabled - labels keep being
+# maintained and denials keep being logged, so re-enforcing later is safe).
+# Requires a change/incident reference so the audit trail says why.
+#   ansible-playbook playbooks/selinux_rollback.yml -l web01 -e change_ref=INC12345
+- name: Roll back to permissive
+  hosts: "{{ target | default('selinux_managed') }}"
+  tasks:
+    - name: Require a change reference
+      ansible.builtin.assert:
+        that: change_ref is defined and change_ref | length > 0
+        fail_msg: "Pass -e change_ref=<CHG/INC number>"
+
+    # Without this, the next drift run (or EDA) would switch the host straight back
+    # to enforcing and undo the break-glass. Re-enforcing goes through the enforce
+    # playbook and its gate again.
+    - name: No longer migrated - drift must leave this host alone
+      ansible.builtin.file:
+        path: "{{ selinux_enforced_marker }}"
+        state: absent
+
+    - name: Permissive (runtime + config)
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+
+    - name: State directory
+      ansible.builtin.file:
+        path: /var/lib/acme-selinux
+        state: directory
+        mode: "0755"
+
+    - name: Leave a note for the next admin and for auditors
+      ansible.builtin.copy:
+        dest: /var/lib/acme-selinux/ROLLED_BACK
+        content: "rolled back to permissive by ansible, ref={{ change_ref }}, at={{ now(utc=true).isoformat() }}\n"
+        mode: "0644"

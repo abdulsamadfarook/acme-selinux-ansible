@@ -1,0 +1,7 @@
+---
+# PHASE 1 - Discovery. Read-only; safe to run against production at any time.
+#   ansible-playbook playbooks/selinux_audit.yml [-e selinux_audit_since=today] [-l web]
+# Output: reports/avc_audit_latest.md + timestamped JSON
+- name: SELinux AVC discovery
+  hosts: "{{ target | default('selinux_managed:legacy') }}"
+  roles: [selinux_audit]

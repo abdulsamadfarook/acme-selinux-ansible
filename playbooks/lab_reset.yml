@@ -1,0 +1,164 @@
+---
+# LAB ONLY: undo everything the SELinux playbooks added, back to "ACME today"
+# (app deployed, permissive, no policy). Replaces VM snapshots where there are none (RHDP).
+#   ansible-playbook playbooks/lab_reset.yml -e confirm_reset=yes
+# Afterwards the audit must say NO again. The app itself stays deployed.
+- name: Lab reset - back to the permissive baseline
+  hosts: "{{ target | default('selinux_managed') }}"
+  tasks:
+    - name: Refuse to run without an explicit confirmation  # noqa: run-once[task] - validation only, linear strategy
+      ansible.builtin.assert:
+        that: confirm_reset | default('') == 'yes'
+        fail_msg: "Destructive lab reset: pass -e confirm_reset=yes"
+      run_once: true
+
+    # First, so nothing below triggers events or a drift run against a half-reset host
+    - name: Stop and disable the EDA forwarder
+      ansible.builtin.systemd_service:
+        name: selinux-eda-forwarder
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove the EDA forwarder files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/selinux-eda-forwarder.service
+        - /usr/local/sbin/selinux-eda-forwarder
+        - /etc/selinux-eda-forwarder.curl
+        - /run/selinux-eda-forwarder.json
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Permissive (runtime + config)
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+
+    # Ports before modules: a port labelled with a module's type (8282 -> acme_api_port_t)
+    # blocks "semodule -r" for that module
+    - name: Remove port labels
+      community.general.seport:
+        ports: "{{ item.ports }}"
+        proto: "{{ item.proto | default('tcp') }}"
+        setype: "{{ item.setype }}"
+        state: absent
+      loop: "{{ selinux_ports | default([]) }}"
+      loop_control:
+        label: "{{ item.proto | default('tcp') }}/{{ item.ports }} -> {{ item.setype }}"
+
+    - name: Remove file context rules
+      community.general.sefcontext:
+        target: "{{ item.target }}"
+        setype: "{{ item.setype }}"
+        ftype: "{{ item.ftype | default('a') }}"
+        state: absent
+      loop: "{{ selinux_fcontexts | default([]) }}"
+      loop_control:
+        label: "{{ item.target }}"
+
+    # Chaos fixes may have been declared and later removed from Git again:
+    # remove them unconditionally so the cleanup order does not matter. Still before
+    # the modules: the applogs rule uses a type from the acme_api module.
+    - name: Remove the chaos new_port fix (8091)
+      community.general.seport:
+        ports: 8091
+        proto: tcp
+        setype: http_port_t
+        state: absent
+      when: inventory_hostname in groups['web'] | default([])
+
+    - name: Remove the chaos app_logdir fix (/srv/acme/applogs rule)
+      community.general.sefcontext:
+        target: '/srv/acme/applogs(/.*)?'
+        setype: acme_api_log_t
+        state: absent
+      when: inventory_hostname in groups['app'] | default([])
+
+    # Assumes every declared boolean is off by default in RHEL (true for the ones we use)
+    - name: Booleans back to the RHEL default
+      ansible.posix.seboolean:
+        name: "{{ item.name }}"
+        state: "{{ not (item.state | bool) }}"
+        persistent: true
+      loop: "{{ selinux_booleans | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Remove per-domain permissive entries we added
+      community.general.selinux_permissive:
+        name: "{{ item }}"
+        permissive: false
+      loop: "{{ selinux_permissive_domains | default([]) }}"
+
+    - name: Loaded modules
+      ansible.builtin.command: semodule -l
+      register: lab_reset_modules
+      changed_when: false
+      check_mode: false
+
+    - name: Remove custom policy modules
+      ansible.builtin.command: semodule -r {{ item.name }}
+      loop: "{{ selinux_modules | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.name in lab_reset_modules.stdout_lines
+      changed_when: true
+
+    # Rules are gone, so restorecon puts the stock (wrong) labels back: default_t etc.
+    # /srv/acme/applogs (chaos app_logdir) is kept, not deleted: acme-api may still be
+    # configured to log there until Deploy below rewrites its config
+    - name: Relabel managed paths with the stock rules
+      ansible.builtin.command: restorecon -R -v {{ item }}
+      loop: >-
+        {{ ((selinux_fcontexts | default([]) | map(attribute='path') | list)
+            + (selinux_restorecon_paths | default([]))
+            + (selinux_modules | default([]) | map(attribute='relabel', default=[]) | flatten)
+            + (['/srv/acme/applogs'] if inventory_hostname in groups['app'] | default([]) else []))
+           | unique }}
+      register: lab_reset_restorecon
+      changed_when: lab_reset_restorecon.stdout | length > 0
+      failed_when: lab_reset_restorecon.rc != 0 and 'No such file' not in lab_reset_restorecon.stderr
+
+    # Both markers (policy applied, migrated), the module builds and the managed-permissive list
+    - name: Remove SELinux state directory
+      ansible.builtin.file:
+        path: /var/lib/acme-selinux
+        state: absent
+
+    # Chaos "mislabel" leftover; Deploy below does not remove files it did not create
+    - name: Remove the chaos page
+      ansible.builtin.file:
+        path: "{{ acme_web_root }}/statement.html"
+        state: absent
+      when: inventory_hostname in groups['web'] | default([])
+
+    # Before the restarts: the denials they cause are the baseline the audit must show
+    - name: Baseline starts now - the next audit ignores everything before the reset
+      ansible.builtin.shell: |
+        mkdir -p "$(dirname {{ selinux_baseline_marker }})"
+        date +%s > {{ selinux_baseline_marker }}
+      changed_when: true
+
+    # Re-executing puts processes back in their stock domains and makes them hit the
+    # missing labels again, so the next audit has denials to find
+    - name: Restart the app services
+      ansible.builtin.systemd_service:
+        name: "{{ item.service }}"
+        state: restarted
+      loop:
+        - {group: db, service: postgresql}
+        - {group: app, service: acme-api}
+        - {group: web, service: httpd}
+      loop_control:
+        label: "{{ item.service }}"
+      when: inventory_hostname in groups[item.group] | default([])
+
+# Redeploy the app: rewrites its config files, which undoes chaos leftovers such as
+# httpd moved to 8091 (new_port), then runs the smoke test (permissive -> must pass)
+- name: Redeploy the app
+  ansible.builtin.import_playbook: acme_deploy.yml

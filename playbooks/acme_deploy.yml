@@ -1,0 +1,29 @@
+---
+# Deploys the 3-tier app the way the app teams do it (no SELinux tasks).
+#   -e acme_lab_baseline=true  ALSO sets every host permissive = "ACME today", the
+#                              starting point of the brief. Lab only: without the flag
+#                              re-running this never touches the SELinux mode, so it is
+#                              safe on hosts that are already enforcing.
+- name: ACME baseline - SELinux permissive everywhere (only with -e acme_lab_baseline=true)
+  hosts: selinux_managed
+  tasks:
+    - name: Permissive (runtime + config) - this is the customer's current state
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+      when: acme_lab_baseline | default(false) | bool
+
+- name: Data tier
+  hosts: db
+  roles: [acme_db]
+
+- name: App tier
+  hosts: app
+  roles: [acme_api]
+
+- name: Web tier
+  hosts: web
+  roles: [acme_web]
+
+- name: Smoke test
+  ansible.builtin.import_playbook: smoke_test.yml

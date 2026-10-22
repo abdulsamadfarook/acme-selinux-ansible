@@ -1,0 +1,28 @@
+---
+# LOCAL LAB ONLY: a snapshot revert restores the guest clock to the moment of the snapshot,
+# and chrony would only SLEW it back (hours). Step it now and always step from now on.
+- name: Step guest clocks to NTP time
+  hosts: "{{ target | default('all') }}"
+  gather_facts: false
+  tasks:
+    - name: Always allow chrony to step the clock
+      ansible.builtin.lineinfile:
+        path: /etc/chrony.conf
+        regexp: '^makestep'
+        line: makestep 1 -1
+      register: chrony_conf
+
+    # Not a handler: chronyd must run the new config BEFORE the step below, not at the end
+    - name: Restart chronyd  # noqa: no-handler
+      ansible.builtin.systemd_service:
+        name: chronyd
+        state: restarted
+      when: chrony_conf is changed
+
+    - name: Step now
+      ansible.builtin.command: chronyc -a makestep
+      changed_when: true
+
+    - name: Wait until synchronised
+      ansible.builtin.command: chronyc waitsync 30 1
+      changed_when: false

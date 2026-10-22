@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+[Service]
+Environment=PGDATA={{ acme_db_data_dir }}
+Environment=PGPORT={{ acme_db_port }}
+# systemd creates this at start-up (tmpfs) - its label comes from the fcontext rules
+RuntimeDirectory={{ acme_db_socket_dir | basename }}
+RuntimeDirectoryPreserve=yes

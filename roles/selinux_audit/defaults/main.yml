@@ -1,0 +1,9 @@
+---
+# Audit window:
+#   auto (default) = since the current policy was applied (marker written by
+#                    selinux_policy), else since the last lab reset (selinux_baseline_marker),
+#                    else the last 30 days
+#   or any ausearch -ts value: recent | today | this-week | this-month | boot | "MM/DD/YY HH:MM:SS"
+selinux_audit_since: auto
+selinux_audit_types: AVC,USER_AVC,SELINUX_ERR,USER_SELINUX_ERR
+selinux_policy_marker: /var/lib/acme-selinux/policy_applied

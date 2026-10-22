@@ -1,0 +1,40 @@
+---
+# LOCAL LAB ONLY - real-time drift with the ansible-rulebook CLI on the control node.
+# AAP uses rulebooks/selinux_drift_aap.yml instead (same rules, run_job_template).
+# Run from the repository root:
+#   ANSIBLE_CONFIG=$PWD/ansible.cfg ansible-rulebook -r lab/eda/selinux_drift_rulebook.yml -i $PWD/inventory --verbose
+# Nodes run selinux-eda-forwarder (playbooks/eda_forwarder.yml), which POSTs audit events
+# to this webhook.
+- name: SELinux real-time compliance
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+  rules:
+    - name: Someone switched a host to permissive
+      condition: event.payload.type == "MAC_STATUS" and event.payload.enforcing == "0"
+      # Remediation itself generates audit events; fire at most once per host per window
+      throttle:
+        once_within: 2 minutes
+        group_by_attributes: [event.payload.host]
+      actions:
+        - debug:
+            msg: "DRIFT: {{ event.payload.host }} set permissive by auid={{ event.payload.auid }} - running drift (re-enforces only migrated hosts)"
+        - run_playbook:
+            name: playbooks/selinux_drift.yml
+            extra_vars:
+              target: "{{ event.payload.host }}"
+
+    - name: A managed boolean was changed outside Ansible
+      condition: event.payload.type == "MAC_CONFIG_CHANGE"
+      throttle:
+        once_within: 2 minutes
+        group_by_attributes: [event.payload.host]
+      actions:
+        - debug:
+            msg: "DRIFT: {{ event.payload.host }} boolean {{ event.payload.bool }}={{ event.payload.val }} by auid={{ event.payload.auid }}"
+        - run_playbook:
+            name: playbooks/selinux_drift.yml
+            extra_vars:
+              target: "{{ event.payload.host }}"

@@ -1,0 +1,26 @@
+---
+# End-to-end check from OUTSIDE the hosts, the way a customer would see it.
+- name: End-to-end smoke test (browser -> web -> app -> db)
+  hosts: localhost
+  gather_facts: false
+  become: false
+  tasks:
+    - name: GET each endpoint through the web tier
+      ansible.builtin.uri:
+        url: "{{ acme_web_url }}{{ item }}"
+        return_content: true
+      loop: [/, /api/health, /api/accounts]
+      register: smoke
+      delegate_to: "{{ acme_smoke_from }}"
+      loop_control:
+        label: "{{ item }}"
+      retries: 3
+      delay: 2
+      until: smoke is succeeded
+
+    - name: Results
+      ansible.builtin.debug:
+        msg: "{{ item.item }} -> {{ item.status }} {{ item.content | truncate(120) }}"
+      loop: "{{ smoke.results }}"
+      loop_control:
+        label: "{{ item.item }}"

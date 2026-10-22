@@ -1,0 +1,41 @@
+---
+# httpd with non-standard port, docroot and log dir, reverse-proxying to acme-api.
+# No SELinux tasks here on purpose (see README).
+- name: Install httpd
+  ansible.builtin.dnf:
+    name: httpd
+    state: present
+
+- name: Create docroot and log dir
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: ["{{ acme_web_root }}", "{{ acme_web_log_dir }}"]
+
+- name: Publish the landing page
+  ansible.builtin.template:
+    src: index.html.j2
+    dest: "{{ acme_web_root }}/index.html"
+    mode: "0644"
+
+- name: Configure the ACME vhost
+  ansible.builtin.template:
+    src: acme.conf.j2
+    dest: /etc/httpd/conf.d/acme.conf
+    mode: "0644"
+  notify: Restart httpd
+
+- name: Open the web port
+  ansible.posix.firewalld:
+    port: "{{ acme_web_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  when: acme_manage_firewall | bool
+
+- name: Start httpd
+  ansible.builtin.systemd_service:
+    name: httpd
+    state: started
+    enabled: true

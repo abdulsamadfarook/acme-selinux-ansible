@@ -1,0 +1,5 @@
+---
+# Platform noise fix (see policy/qemu_ga_noise/qemu_ga_noise.te): dontaudit only.
+selinux_modules:
+  - name: qemu_ga_noise
+    src: "{{ ansible_config_file | dirname }}/policy/qemu_ga_noise"

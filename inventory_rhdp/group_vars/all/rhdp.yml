@@ -1,0 +1,5 @@
+---
+# RHDP differences from the lab. Loaded after main.yml (files load in name order),
+# so these win.
+acme_manage_firewall: false   # firewalld is not running on the RHDP nodes
+acme_smoke_from: rhel-2       # AAP's execution pods cannot reach port 8090; rhel-2 can

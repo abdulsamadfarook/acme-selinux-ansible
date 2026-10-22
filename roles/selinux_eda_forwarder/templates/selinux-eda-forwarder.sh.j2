@@ -1,0 +1,26 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# Follows the audit log and POSTs every SELinux state change to EDA as JSON.
+#   MAC_STATUS        -> setenforce / enforcing changes
+#   MAC_CONFIG_CHANGE -> setsebool (runtime or persistent)
+#   MAC_POLICY_LOAD   -> semodule / policy reloads
+# In production prefer a supported pipe (rsyslog omhttp / Splunk / Kafka source);
+# this keeps the lab dependency-free.
+URL="{{ selinux_eda_url }}"
+HOST="{{ inventory_hostname }}"
+# Event Stream credentials live in a root-only curl config (empty in the lab),
+# so they never show up in this script or in ps.
+CURL_OPTS=(-s -m 5 -K /etc/selinux-eda-forwarder.curl{{ ' -k' if selinux_eda_insecure | bool else '' }})
+tail -n0 -F /var/log/audit/audit.log | while read -r line; do
+  case "$line" in
+    *type=MAC_STATUS*|*type=MAC_CONFIG_CHANGE*|*type=MAC_POLICY_LOAD*) ;;
+    *) continue ;;
+  esac
+  type=$(sed -n 's/.*type=\([A-Z_]*\).*/\1/p' <<<"$line")
+  get() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<"$line"; }
+  jq -cn --arg host "$HOST" --arg type "$type" --arg enforcing "$(get enforcing)" \
+         --arg bool "$(get bool)" --arg val "$(get val)" --arg auid "$(get auid)" --arg raw "$line" \
+    '{host:$host, type:$type, enforcing:$enforcing, bool:$bool, val:$val, auid:$auid, raw:$raw}' \
+  > /run/selinux-eda-forwarder.json
+  curl "${CURL_OPTS[@]}" -H 'Content-Type: application/json' -d @/run/selinux-eda-forwarder.json "$URL" >/dev/null || true
+done

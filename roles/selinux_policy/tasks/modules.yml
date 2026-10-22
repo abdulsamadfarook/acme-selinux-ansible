@@ -1,0 +1,60 @@
+---
+# Build and load one custom Type Enforcement module from .te/.fc/.if sources.
+# Idempotency: a sha256 of the sources is stored next to the build; the module is
+# only rebuilt and reloaded (semodule -i) when the sources change or it is missing.
+- name: "Stage sources | {{ selinux_module.name }}"
+  ansible.builtin.copy:
+    src: "{{ selinux_module.src }}/"
+    dest: "{{ selinux_module_build_dir }}/{{ selinux_module.name }}/"
+    mode: "0644"
+  register: selinux_module_src
+
+- name: "Is it loaded? | {{ selinux_module.name }}"
+  ansible.builtin.command: semodule -l
+  register: selinux_loaded_modules
+  changed_when: false
+  check_mode: false
+
+- name: "Compile and install | {{ selinux_module.name }}"
+  when: >-
+    selinux_module_src is changed or
+    selinux_module.name not in selinux_loaded_modules.stdout_lines
+  block:
+    # Check mode did not really stage the sources, so the build dir may not exist
+    # and make/semodule cannot run: report what would happen instead
+    - name: "Would compile and load (check mode) | {{ selinux_module.name }}"
+      ansible.builtin.debug:
+        msg: "would compile {{ selinux_module.name }}.pp and load it with semodule -i"
+      when: ansible_check_mode
+      changed_when: true
+
+    - name: "Compile (.te -> .pp) | {{ selinux_module.name }}"
+      ansible.builtin.command:
+        cmd: make -f /usr/share/selinux/devel/Makefile {{ selinux_module.name }}.pp
+        chdir: "{{ selinux_module_build_dir }}/{{ selinux_module.name }}"
+      when: not ansible_check_mode
+      changed_when: true
+
+    - name: "Load (semodule -i) | {{ selinux_module.name }}"
+      ansible.builtin.command:
+        cmd: semodule -i {{ selinux_module.name }}.pp
+        chdir: "{{ selinux_module_build_dir }}/{{ selinux_module.name }}"
+      when: not ansible_check_mode
+      changed_when: true
+
+    # A running process keeps its old domain until it is re-executed, so a new
+    # domain only takes effect after a restart of the service it confines.
+    - name: "Note the reload (moves the enforcement gate marker) | {{ selinux_module.name }}"
+      ansible.builtin.set_fact:
+        selinux_module_reloaded: true
+
+    - name: "Relabel paths named in the module | {{ selinux_module.name }}"
+      ansible.builtin.command: restorecon -R {{ selinux_module.relabel | default([]) | join(' ') }}
+      when:
+        - not ansible_check_mode
+        - selinux_module.relabel | default([]) | length > 0
+      changed_when: true
+
+    - name: "Queue restart of confined services (done after ports and booleans) | {{ selinux_module.name }}"
+      ansible.builtin.set_fact:
+        selinux_restart_queue: "{{ selinux_restart_queue | default([]) + selinux_module.restart | default([]) }}"

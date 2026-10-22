@@ -1,0 +1,59 @@
+---
+# ---------- Application topology (the "ACME core banking" stand-in) ----------
+acme_web_port: 8090                 # non-standard web port
+acme_web_root: /data/acme/htdocs    # non-standard docroot (default_t, unlike /srv/*/www)
+acme_web_log_dir: /data/acme/weblogs  # non-standard httpd log dir
+
+acme_api_host: "{{ hostvars[groups['app'][0]].acme_ip | default(hostvars[groups['app'][0]].ansible_host) }}"
+acme_api_port: 8282                 # non-standard app port
+acme_api_log_dir: /var/log/acme     # custom app log dir
+acme_api_run_dir: /run/acme         # runtime dir; socket NAME is dynamic (admin-<pid>.sock)
+
+acme_db_host: "{{ hostvars[groups['db'][0]].acme_ip | default(hostvars[groups['db'][0]].ansible_host) }}"
+acme_db_port: 5433                  # non-standard PostgreSQL port
+acme_db_data_dir: /data/pgsql       # non-standard PGDATA
+acme_db_log_dir: /var/log/acme-pgsql
+acme_db_socket_dir: /run/acme-pgsql # non-standard unix socket dir
+acme_db_name: acme
+acme_db_user: acme
+acme_db_password: "acme-lab-only"   # lab only - use Ansible Vault / AAP credential in real life
+
+# Host addresses the tiers use to talk to each other: "acme_ip" when the inventory sets
+# it (RHDP: the VM-to-VM network differs from the address Ansible connects to),
+# otherwise ansible_host (lab)
+acme_web_url: "http://{{ hostvars[groups['web'][0]].acme_ip | default(hostvars[groups['web'][0]].ansible_host) }}:{{ acme_web_port }}"
+# Where the smoke test runs from: the control node in the lab; in RHDP another node,
+# because AAP's execution pods cannot reach the app ports
+acme_smoke_from: localhost
+# Open the app ports in firewalld (RHDP nodes do not run firewalld)
+acme_manage_firewall: true
+
+# ---------- SELinux programme defaults (overridden per tier in group_vars/<tier>) ----------
+selinux_policy: targeted
+selinux_fcontexts: []       # [{target: regex, setype: type, path: dir-to-restorecon}]
+selinux_ports: []           # [{ports: "8090", proto: tcp, setype: http_port_t}]
+selinux_booleans: []        # [{name: bool, state: true}]
+selinux_modules: []         # [{name: acme_api, src: path-to-dir-with .te/.fc/.if}]
+selinux_restorecon_paths: []  # extra paths to relabel (e.g. those labelled by a module .fc)
+selinux_permissive_domains: []  # per-domain permissive while a custom module is being tuned
+
+# Written by the enforce role when a host has passed gate + soak = "migrated".
+# Drift only enforces the mode on migrated hosts; the rollback removes it.
+selinux_enforced_marker: /var/lib/acme-selinux/enforced
+
+# Written by playbooks/lab_reset.yml (epoch, host clock). Until a policy is applied,
+# the audit window starts here instead of 30 days back, so earlier test runs drop out.
+selinux_baseline_marker: /var/lib/acme-selinux/baseline_since
+
+# Enforcement gate: max AVC denials allowed since the policy was last applied
+selinux_gate_max_denials: 0
+# Seconds to watch a host after setenforce 1 before declaring success
+selinux_soak_seconds: 20
+
+# Local health checks per tier: the enforce role rolls back if any fails
+acme_health_checks: []
+
+# Controller-side folder for audit / enforcement evidence
+# Based on ansible.cfg, not inventory_dir: ansible-rulebook runs playbooks from a temp
+# copy of the project, so inventory_dir/../reports does not exist there
+selinux_report_dir: "{{ ansible_config_file | dirname }}/reports"

@@ -1,0 +1,50 @@
+---
+# AAP - real-time drift, run by an EDA "rulebook activation".
+# (The local-lab equivalent with the ansible-rulebook CLI is lab/eda/selinux_drift_rulebook.yml.)
+#   - Events arrive through an AAP Event Stream (HTTPS on the platform gateway, with
+#     credentials) that the activation maps onto the webhook source below. The port is
+#     only used when the rulebook runs without an event stream.
+#   - The action launches the Controller job template "SELinux 4 - Drift" for the one
+#     host that sent the event, so the fix gets the same job history, RBAC and audit
+#     trail as every other change. That template needs "Prompt on launch" for Limit
+#     and Job type.
+# Lives in rulebooks/ because that is where an EDA project looks for rulebooks.
+- name: SELinux real-time compliance (AAP)
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: 5000
+  rules:
+    - name: Someone switched a host to permissive
+      condition: event.payload.type == "MAC_STATUS" and event.payload.enforcing == "0"
+      # Remediation itself generates audit events; fire at most once per host per window
+      throttle:
+        once_within: 2 minutes
+        group_by_attributes: [event.payload.host]
+      actions:
+        - debug:
+            msg: "DRIFT: {{ event.payload.host }} set permissive by auid={{ event.payload.auid }} - launching drift (re-enforces only migrated hosts)"
+        - run_job_template:
+            name: SELinux 4 - Drift
+            organization: Default
+            include_events: false
+            job_args:
+              limit: "{{ event.payload.host }}"
+              job_type: run
+
+    - name: A managed boolean was changed outside Ansible
+      condition: event.payload.type == "MAC_CONFIG_CHANGE"
+      throttle:
+        once_within: 2 minutes
+        group_by_attributes: [event.payload.host]
+      actions:
+        - debug:
+            msg: "DRIFT: {{ event.payload.host }} boolean {{ event.payload.bool }}={{ event.payload.val }} by auid={{ event.payload.auid }}"
+        - run_job_template:
+            name: SELinux 4 - Drift
+            organization: Default
+            include_events: false
+            job_args:
+              limit: "{{ event.payload.host }}"
+              job_type: run

@@ -1,0 +1,12 @@
+# {{ ansible_managed }}
+[Unit]
+Description=Forward SELinux state changes to Event-Driven Ansible
+After=auditd.service network-online.target
+
+[Service]
+ExecStart=/usr/local/sbin/selinux-eda-forwarder
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

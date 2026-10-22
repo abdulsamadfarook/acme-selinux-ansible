@@ -1,0 +1,11 @@
+---
+# Where events go. Default = the local lab's ansible-rulebook webhook on the libvirt bridge.
+# In AAP the Event Stream URL is passed through the job template survey.
+# AAP: the Event Stream URL shown in Automation Decisions -> Event Streams.
+selinux_eda_url: "http://192.168.122.1:5000/endpoint"
+# Event Stream credential (type "Basic Event Stream"). Empty = no auth (lab).
+# Pass these from AAP (survey password field / credential), never from Git.
+selinux_eda_user: ""
+selinux_eda_password: ""
+# true only if the gateway certificate is not trusted by the nodes
+selinux_eda_insecure: false

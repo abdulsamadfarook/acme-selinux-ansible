@@ -1,0 +1,3 @@
+---
+# false = report only (use with --check / a read-only AAP job template)
+selinux_drift_remediate: true

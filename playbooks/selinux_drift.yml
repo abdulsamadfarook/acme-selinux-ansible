@@ -1,0 +1,11 @@
+---
+# PHASE 4 - Continuous compliance. Schedule it (AAP schedule / cron) and trigger it
+# from EDA when an audit event shows someone ran setenforce 0 / setsebool.
+#   ansible-playbook playbooks/selinux_drift.yml --check --diff      # report only
+#   ansible-playbook playbooks/selinux_drift.yml                     # report + fix
+- name: Detect and remediate SELinux drift
+  hosts: "{{ target | default('selinux_managed') }}"
+  # minimal facts (still includes ansible_facts.selinux): the full set took ~16 s in
+  # the lab, which dominated EDA's time-to-remediate
+  gather_subset: [min]
+  roles: [selinux_drift]

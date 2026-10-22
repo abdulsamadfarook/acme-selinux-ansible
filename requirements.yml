@@ -1,0 +1,6 @@
+---
+collections:
+  - name: ansible.posix        # selinux, seboolean, firewalld
+  - name: community.general    # sefcontext, seport, selinux_permissive
+    version: ">=11.0.0,<12.0.0"   # 11.x is the last line supporting ansible-core 2.16 (AAP 2.5 EE)
+  - name: ansible.eda          # webhook source for the EDA rulebook

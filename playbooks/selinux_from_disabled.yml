@@ -1,0 +1,7 @@
+---
+# Disabled -> permissive (+ full relabel + reboot). One host at a time.
+#   ansible-playbook playbooks/selinux_from_disabled.yml -l legacy01
+- name: Bring SELinux-disabled hosts back safely
+  hosts: "{{ target | default('legacy') }}"
+  serial: 1
+  roles: [selinux_from_disabled]

@@ -1,0 +1,13 @@
+---
+selinux_fcontexts:
+  - {target: '/data/pgsql(/.*)?', setype: postgresql_db_t, path: /data/pgsql}
+  - {target: '/var/log/acme-pgsql(/.*)?', setype: postgresql_log_t, path: /var/log/acme-pgsql}
+  # systemd RuntimeDirectory= consults these rules when it creates the dir at every boot
+  # RHEL 9 has the fcontext equivalence '/run = /var/run': rules must use /var/run
+  - {target: '/var/run/acme-pgsql(/.*)?', setype: postgresql_var_run_t, path: /run/acme-pgsql}
+selinux_ports:
+  - {ports: "{{ acme_db_port }}", proto: tcp, setype: postgresql_port_t}
+selinux_booleans: []
+
+acme_health_checks: []     # db health is checked with pg_isready in the enforce role
+acme_db_health_cmd: "pg_isready -h {{ acme_db_socket_dir }} -p {{ acme_db_port }}"

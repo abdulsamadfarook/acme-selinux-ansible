@@ -1,0 +1,4 @@
+/opt/acme/api/acme-api	--	gen_context(system_u:object_r:acme_api_exec_t,s0)
+/etc/acme(/.*)?			gen_context(system_u:object_r:acme_api_conf_t,s0)
+/var/log/acme(/.*)?		gen_context(system_u:object_r:acme_api_log_t,s0)
+/var/run/acme(/.*)?			gen_context(system_u:object_r:acme_api_var_run_t,s0)

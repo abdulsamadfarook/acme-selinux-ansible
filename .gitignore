@@ -1,0 +1,10 @@
+.venv/
+.ansible/
+# installed collections are downloaded, not ours; keep requirements.yml (AAP reads it)
+collections/ansible_collections/
+logs/
+reports/
+__pycache__/
+*.whl
+# personal rehearsal notes, kept outside the submission
+DEMO.md

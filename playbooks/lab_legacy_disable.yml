@@ -1,0 +1,40 @@
+---
+# LOCAL LAB ONLY: recreate the "SELINUX=disabled" starting point on legacy01.
+- name: Put legacy01 into the disabled state
+  hosts: legacy
+  tasks:
+    - name: A service to keep an eye on across the reboot
+      ansible.builtin.systemd_service:
+        name: httpd
+        state: started
+        enabled: true
+
+    - name: Open port 80
+      ansible.posix.firewalld:
+        service: http
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Disable SELinux the RHEL 9 way (kernel argument)
+      ansible.builtin.command: grubby --update-kernel=ALL --args=selinux=0
+      changed_when: true
+
+    - name: And the legacy way (config file)
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: SELINUX=disabled
+
+    - name: Reboot into disabled
+      ansible.builtin.reboot:
+
+    - name: Create files while disabled - they will have NO label
+      ansible.builtin.shell: |
+        mkdir -p /srv/legacy && date > /srv/legacy/created-while-disabled.txt
+        cp /etc/hosts /var/www/html/hosts.txt
+      changed_when: true
+
+    - name: State
+      ansible.builtin.command: getenforce
+      changed_when: false

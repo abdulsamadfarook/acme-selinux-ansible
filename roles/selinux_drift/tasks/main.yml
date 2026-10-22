@@ -1,0 +1,130 @@
+---
+# Continuous compliance: the declared state in Git is the source of truth.
+# Catches: setenforce 0, SELINUX= edits, boolean flips, removed port/fcontext rules,
+# mislabelled files, rogue permissive domains, selinux=0 on the kernel cmdline.
+
+- name: Runtime mode
+  ansible.builtin.command: getenforce
+  register: selinux_drift_runtime
+  changed_when: false
+  check_mode: false
+
+- name: Configured mode
+  ansible.builtin.command: awk -F= '/^SELINUX=/{print $2}' /etc/selinux/config
+  register: selinux_drift_config
+  changed_when: false
+  check_mode: false
+
+# Only hosts that passed the enforce gate are expected to be enforcing. A host that
+# is still permissive because it has not been migrated yet is NOT drift: switching
+# it here would skip the gate (and undo a break-glass rollback).
+- name: Has this host been migrated to enforcing?
+  ansible.builtin.stat:
+    path: "{{ selinux_enforced_marker }}"
+  register: selinux_drift_marker
+
+- name: Who changed SELinux state today? (audit trail - auid survives sudo)
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    ausearch --input-logs -m MAC_STATUS,MAC_CONFIG_CHANGE,MAC_POLICY_LOAD -ts today -i 2>/dev/null
+    | grep -E 'type=MAC_' | tail -n 20 || true
+  register: selinux_drift_who
+  changed_when: false
+  check_mode: false
+
+- name: Local customisations nobody declared (report only)
+  ansible.builtin.shell: |
+    set -o pipefail
+    echo "## booleans";   semanage boolean -l -C -n
+    echo "## ports";      semanage port -l -C -n
+    echo "## fcontext";   semanage fcontext -l -C -n
+    echo "## permissive (customized)"; semanage permissive -l | sed -n '/Customized/,$p' | tail -n +2
+  register: selinux_drift_local
+  changed_when: false
+  check_mode: false
+
+- name: Declared booleans whose runtime or persistent value differs
+  ansible.builtin.shell: |
+    set -o pipefail
+    {% for b in selinux_booleans %}
+    want={{ 'on' if b.state | bool else 'off' }}
+    line=$(semanage boolean -l -n | awk '$1 == "{{ b.name }}"')
+    rt=$(echo "$line" | sed -E 's/.*\(([a-z]+) *, *([a-z]+)\).*/\1/')
+    pe=$(echo "$line" | sed -E 's/.*\(([a-z]+) *, *([a-z]+)\).*/\2/')
+    [ "$rt" = "$want" ] || echo "{{ b.name }} runtime=$rt (want $want)"
+    [ "$pe" = "$want" ] || echo "{{ b.name }} persistent=$pe (want $want)"
+    {% endfor %}
+    true
+  register: selinux_drift_bool_state
+  changed_when: false
+  check_mode: false
+
+- name: Undeclared persistent booleans
+  ansible.builtin.set_fact:
+    selinux_drift_rogue_booleans: >-
+      {{ selinux_drift_local.stdout_lines
+         | select('match', '^\S+\s+\(')
+         | map('regex_replace', '^(\S+).*$', '\1')
+         | reject('in', selinux_booleans | map(attribute='name') | list) | list }}
+
+- name: Drift summary
+  ansible.builtin.set_fact:
+    selinux_drift:
+      host: "{{ inventory_hostname }}"
+      runtime: "{{ selinux_drift_runtime.stdout }}"
+      config: "{{ selinux_drift_config.stdout }}"
+      migrated: "{{ selinux_drift_marker.stat.exists }}"
+      mode_drift: >-
+        {{ selinux_drift_marker.stat.exists and
+           (selinux_drift_runtime.stdout != 'Enforcing' or selinux_drift_config.stdout != 'enforcing') }}
+      boolean_drift: "{{ selinux_drift_bool_state.stdout_lines }}"
+      rogue_booleans: "{{ selinux_drift_rogue_booleans }}"
+      permissive_domains: >-
+        {{ selinux_drift_local.stdout_lines[(selinux_drift_local.stdout_lines.index('## permissive (customized)') + 1):]
+           | map('trim') | select | list }}
+      recent_changes: "{{ selinux_drift_who.stdout_lines }}"
+
+- name: Report
+  ansible.builtin.debug:
+    var: selinux_drift
+
+# ---- remediation -------------------------------------------------------------
+- name: Remediate mode drift (runtime + config)
+  ansible.posix.selinux:
+    policy: "{{ selinux_policy }}"
+    state: enforcing
+  when: selinux_drift_remediate | bool and selinux_drift.mode_drift | bool
+
+- name: Re-assert declared policy (booleans, ports, fcontexts, labels, modules)
+  ansible.builtin.include_role:
+    name: selinux_policy
+  when: selinux_drift_remediate | bool or ansible_check_mode
+
+# reports/ is not in Git, so it does not exist in an AAP job: create it first
+- name: Report directory on the controller
+  ansible.builtin.file:
+    path: "{{ selinux_report_dir }}"
+    state: directory
+    mode: "0755"
+  check_mode: false
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Fleet drift report on the controller
+  ansible.builtin.template:
+    src: drift_report.md.j2
+    dest: "{{ selinux_report_dir }}/drift_latest.md"
+    mode: "0644"
+  changed_when: false   # a fresh report is not a change to the fleet
+  check_mode: false   # the report is the point of a --check run
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+# In AAP reports/ lives in the job's container and is deleted with it; the job
+# output is kept, so the report is printed there as the evidence
+- name: Drift report (kept in the job output)
+  ansible.builtin.debug:
+    msg: "{{ lookup('ansible.builtin.file', selinux_report_dir ~ '/drift_latest.md').splitlines() }}"
+  run_once: true

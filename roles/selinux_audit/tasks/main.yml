@@ -1,0 +1,169 @@
+---
+# Discovery: what WOULD break if this host went enforcing?
+# In permissive mode the kernel still evaluates every access and logs an AVC with
+# permissive=1 for anything the policy would have denied - so production traffic
+# itself generates the to-do list, with zero impact on the application.
+#
+# Every ausearch here uses --input-logs: without a TTY (Ansible, cron, AAP) ausearch
+# otherwise reads STDIN instead of the audit logs and silently reports nothing.
+
+- name: Ensure auditd is running (AVC source of truth)
+  ansible.builtin.systemd_service:
+    name: auditd
+    state: started
+    enabled: true
+
+- name: Current SELinux mode
+  ansible.builtin.command: getenforce
+  register: selinux_audit_mode
+  changed_when: false
+  check_mode: false
+
+- name: Resolve the audit window
+  ansible.builtin.shell: |
+    set -o pipefail
+    if [ "{{ selinux_audit_since }}" != "auto" ]; then
+      echo "{{ selinux_audit_since }}"
+    elif [ -s {{ selinux_policy_marker }} ]; then
+      ts=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["applied_at"])' {{ selinux_policy_marker }})
+      # A window that starts in the future of the host clock reports 0 silently - fail instead
+      if [ "$ts" -gt $(( $(date +%s) + 60 )) ]; then
+        echo "policy marker $ts is ahead of host clock $(date +%s): fix time sync" >&2; exit 3
+      fi
+      LC_ALL=C date -d "@$ts" '+%x %T'
+    elif [ -n "{{ selinux_baseline_marker | default('') }}" ] && [ -s "{{ selinux_baseline_marker | default('') }}" ]; then
+      # No policy yet, but a lab reset recorded a clean starting point
+      LC_ALL=C date -d "@$(cat {{ selinux_baseline_marker }})" '+%x %T'
+    else
+      # Rolling 30 days, not "this-week": a port bind is logged only when the service
+      # starts, and "this-week" resets every Sunday and silently drops it
+      LC_ALL=C date -d '30 days ago' '+%x %T'
+    fi
+  register: selinux_audit_window
+  changed_when: false
+  check_mode: false
+
+- name: Pin the end of the window (host clock) so the report is reproducible
+  ansible.builtin.command: env LC_ALL=C date '+%x %T'
+  register: selinux_audit_window_end
+  changed_when: false
+  check_mode: false
+
+- name: Install the AVC summariser
+  ansible.builtin.copy:
+    src: avc_summary.py
+    dest: /usr/local/libexec/avc_summary.py
+    mode: "0755"
+
+- name: Pull and summarise audit records
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    LC_ALL=C ausearch --input-logs -m {{ selinux_audit_types }}
+    -ts {{ selinux_audit_window.stdout }} -te {{ selinux_audit_window_end.stdout }} --raw 2>/dev/null
+    | /usr/local/libexec/avc_summary.py
+  register: selinux_audit_raw
+  changed_when: false
+  check_mode: false
+  failed_when: false   # ausearch exits 1 when there is nothing to report
+
+# A service with no policy runs as unconfined_service_t: it is never denied, so it
+# never shows up as a denial - which must NOT be reported as "ready".
+- name: Services running unconfined (no SELinux policy of their own)
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    ps -e -o label=,comm= | awk '$1 ~ /:unconfined_service_t:/ {print $2}' | sort -u
+  register: selinux_audit_unconfined
+  changed_when: false
+  check_mode: false
+
+- name: Human-readable explanation of each denial (audit2why)
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    LC_ALL=C ausearch --input-logs -m AVC,USER_AVC -ts {{ selinux_audit_window.stdout }} -te {{ selinux_audit_window_end.stdout }} --raw 2>/dev/null
+    | audit2why | head -n 200
+  register: selinux_audit_why
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+# Suggested allow rules are EVIDENCE for a human, never applied automatically:
+# audit2allow happily suggests over-broad rules (e.g. allow httpd_t to read default_t).
+- name: Suggested allow rules (audit2allow) - for review only
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    LC_ALL=C ausearch --input-logs -m AVC,USER_AVC -ts {{ selinux_audit_window.stdout }} -te {{ selinux_audit_window_end.stdout }} --raw 2>/dev/null
+    | audit2allow -R
+  register: selinux_audit_allow
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Parse summary
+  ansible.builtin.set_fact:
+    selinux_audit_summary: >-
+      {{ (selinux_audit_raw.stdout | default('', true)
+          or '{"total":0,"enforced":0,"selinux_errors":0,"denials":[],"root_causes":[]}') | from_json }}
+
+# Verdict, in order of precedence:
+#   NOT ASSESSABLE - SELinux disabled: nothing is evaluated, so 0 denials proves nothing
+#   NO             - denials or SELINUX_ERRs in the window
+#   REVIEW         - no denials, but unconfined services (enforcing would not protect them)
+#   YES            - no denials, nothing unconfined
+# Computed INSIDE the dict, not as its own set_fact: ansible-core < 2.19 (AAP 2.5's
+# execution environment) turns a top-level set_fact string "YES"/"NO" into True/False.
+- name: Store per-host result  # noqa: jinja[spacing] - whitespace control is deliberate, tested on 2.16
+  ansible.builtin.set_fact:
+    selinux_audit_result:
+      host: "{{ inventory_hostname }}"
+      mode: "{{ selinux_audit_mode.stdout }}"
+      window: "{{ selinux_audit_window.stdout }}"
+      window_end: "{{ selinux_audit_window_end.stdout }}"
+      verdict: >-
+        {%- if selinux_audit_mode.stdout == 'Disabled' -%}NOT ASSESSABLE
+        {%- elif selinux_audit_summary.total > 0 or selinux_audit_summary.selinux_errors > 0 -%}NO
+        {%- elif selinux_audit_unconfined.stdout_lines | length > 0 -%}REVIEW
+        {%- else -%}YES{%- endif -%}
+      unconfined: "{{ selinux_audit_unconfined.stdout_lines }}"
+      summary: "{{ selinux_audit_summary }}"
+      audit2why: "{{ selinux_audit_why.stdout | default('') }}"
+      audit2allow: "{{ selinux_audit_allow.stdout | default('') }}"
+
+- name: Per-host summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }} ({{ selinux_audit_mode.stdout }}, since {{ selinux_audit_window.stdout }}):
+      {{ selinux_audit_summary.total }} AVC records -> {{ selinux_audit_summary.root_causes | length }} root causes,
+      {{ selinux_audit_summary.selinux_errors }} SELINUX_ERR,
+      unconfined={{ selinux_audit_unconfined.stdout_lines | join(',') or 'none' }}
+      => {{ selinux_audit_result.verdict }}
+
+- name: Write fleet report on the controller
+  run_once: true
+  delegate_to: localhost
+  become: false
+  block:
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ selinux_report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write JSON (machine-readable, for dashboards / tickets)
+      ansible.builtin.copy:
+        dest: "{{ selinux_report_dir }}/avc_audit_{{ now().strftime('%Y%m%d_%H%M%S') }}.json"
+        content: "{{ ansible_play_hosts | map('extract', hostvars, 'selinux_audit_result') | list | to_nice_json }}"
+        mode: "0644"
+      changed_when: false
+
+    - name: Write Markdown (for humans / change board)
+      ansible.builtin.template:
+        src: avc_report.md.j2
+        dest: "{{ selinux_report_dir }}/avc_audit_latest.md"
+        mode: "0644"
+      changed_when: false
+
+    # In AAP reports/ lives in the job's container and is deleted with it; the job
+    # output is kept, so the report is printed there as the evidence
+    - name: Report (kept in the job output)
+      ansible.builtin.debug:
+        msg: "{{ lookup('ansible.builtin.file', selinux_report_dir ~ '/avc_audit_latest.md').splitlines() }}"

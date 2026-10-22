@@ -1,0 +1,50 @@
+# SELinux discovery report
+
+Generated {{ now().strftime('%Y-%m-%d %H:%M:%S') }} · hosts: {{ ansible_play_hosts | length }}
+
+{% set results = ansible_play_hosts | map('extract', hostvars, 'selinux_audit_result') | list %}
+| Host | Mode | Window | AVC records | Root causes | SELINUX_ERR | Unconfined services | Verdict |
+|---|---|---|---|---|---|---|---|
+{% for r in results %}
+| {{ r.host }} | {{ r.mode }} | {{ r.window }} → {{ r.window_end }} | {{ r.summary.total }} | {{ r.summary.root_causes | length }} | {{ r.summary.selinux_errors }} | {{ r.unconfined | join(', ') or '-' }} | **{{ r.verdict }}** |
+{% endfor %}
+
+**Verdicts:** YES = no denials and nothing unconfined · NO = fix the root causes below first ·
+REVIEW = no denials, but the listed services have no policy (enforcing will not confine them) ·
+NOT ASSESSABLE = SELinux disabled, nothing is evaluated, so "0 denials" proves nothing.
+
+**Limits of this report:** denials suppressed by `dontaudit` rules are not logged and therefore
+not counted (temporarily `semodule -DB` while reproducing, then `semodule -B`). Code paths that
+did not run during the window (month-end jobs, DR) are not represented.
+
+{% for r in results if r.summary.root_causes %}
+## {{ r.host }} - {{ r.summary.root_causes | length }} root causes ({{ r.summary.total }} records)
+
+| Fix | Domain | Target type | Port | Records | Permissions | Examples | Hint | Already enforced? |
+|---|---|---|---|---|---|---|---|---|
+{% for c in r.summary.root_causes %}
+| {{ c.fix }} | {{ c.scontext }} | {{ c.tcontext }} | {{ c.port or '' }} | {{ c.records }} | {{ c.perms | join(' ') }} | {{ c.examples | join('<br>') }} | {{ c.hint }} | {{ 'YES - breaking now' if c.enforced else 'no' }} |
+{% endfor %}
+
+Suggested starting points (verify the right type before applying):
+{% for c in r.summary.root_causes %}
+- `{{ c.suggestion }}`
+{% endfor %}
+
+<details><summary>All {{ r.summary.denials | length }} unique denial tuples</summary>
+
+| count | process | source | target | class | perms | permissive | example |
+|---|---|---|---|---|---|---|---|
+{% for d in r.summary.denials %}
+| {{ d.count }} | {{ d.comm }} | {{ d.scontext }} | {{ d.tcontext }} | {{ d.tclass }} | {{ d.perms }} | {{ d.permissive }} | {{ d.sample_name }} |
+{% endfor %}
+</details>
+
+<details><summary>audit2allow -R (suggestions - review, do not apply blindly)</summary>
+
+```
+{{ r.audit2allow }}
+```
+</details>
+
+{% endfor %}

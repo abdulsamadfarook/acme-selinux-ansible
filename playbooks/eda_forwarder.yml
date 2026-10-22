@@ -1,0 +1,4 @@
+---
+- name: Ship SELinux state-change events to EDA
+  hosts: "{{ target | default('selinux_managed') }}"
+  roles: [selinux_eda_forwarder]

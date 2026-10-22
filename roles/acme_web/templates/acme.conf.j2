@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+Listen {{ acme_web_port }}
+
+<VirtualHost *:{{ acme_web_port }}>
+    ServerName acme.lab.local
+    DocumentRoot {{ acme_web_root }}
+    ErrorLog  {{ acme_web_log_dir }}/error.log
+    CustomLog {{ acme_web_log_dir }}/access.log combined
+
+    <Directory {{ acme_web_root }}>
+        Require all granted
+    </Directory>
+
+    # Reverse proxy to the app tier (non-standard port on another host)
+    ProxyPass        /api/ http://{{ acme_api_host }}:{{ acme_api_port }}/
+    ProxyPassReverse /api/ http://{{ acme_api_host }}:{{ acme_api_port }}/
+</VirtualHost>

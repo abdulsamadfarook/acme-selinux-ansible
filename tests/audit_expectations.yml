@@ -1,0 +1,61 @@
+---
+# Ground truth for evaluating the audit report. Each case lists, per host, the
+# verdict the report MUST give and root causes it MUST find. Root causes match on
+# fix + domain + target type (+ port when given).
+audit_eval_cases:
+
+  # Lab snapshot "acme-permissive" / "demo-ready": app deployed, no policy yet
+  baseline:
+    db01:
+      verdict: "NO"
+      must_find:
+        - {fix: label, scontext: postgresql_t, tcontext: default_t}   # PGDATA /data/pgsql
+        - {fix: port, scontext: postgresql_t, tcontext: unreserved_port_t, port: "5433"}
+        - {fix: label, scontext: postgresql_t, tcontext: var_run_t}   # /run/acme-pgsql socket
+    web01:
+      verdict: "NO"
+      must_find:
+        - {fix: port, scontext: httpd_t, tcontext: unreserved_port_t, port: "8090"}   # bind
+        - {fix: port, scontext: httpd_t, tcontext: unreserved_port_t, port: "8282"}   # proxy connect
+        - {fix: label, scontext: httpd_t, tcontext: default_t}                         # /data/acme/*
+    app01:
+      verdict: "REVIEW"   # no denials, but acme-api is unconfined
+      must_be_unconfined: [acme-api]
+
+  # After selinux_policy.yml (window = since the policy marker)
+  post_policy:
+    db01: {verdict: "YES", max_root_causes: 0}
+    web01: {verdict: "YES", max_root_causes: 0}
+    app01: {verdict: "YES", max_root_causes: 0, must_not_be_unconfined: [acme-api]}
+
+  # legacy01 after playbooks/lab_legacy_disable.yml
+  disabled:
+    legacy01: {verdict: "NOT ASSESSABLE"}
+
+  # Chaos scenarios (hosts enforcing; window = since the policy marker)
+  chaos_mislabel:
+    web01:
+      verdict: "NO"
+      must_find: [{fix: label, scontext: httpd_t, tcontext: user_tmp_t}]
+  chaos_new_port:
+    web01:
+      verdict: "NO"
+      must_find: [{fix: port, scontext: httpd_t, tcontext: unreserved_port_t, port: "8091"}]
+  chaos_app_logdir:
+    app01:
+      verdict: "NO"
+      # /srv/acme/applogs is var_t via the stock rule "/srv/.*" - NOT default_t
+      # (my first ground truth said default_t; the report was right, the test was wrong)
+      must_find: [{fix: label, scontext: acme_api_t, tcontext: var_t}]
+  chaos_db_datadir:
+    db01:
+      verdict: "NO"
+      must_find: [{fix: label, scontext: postgresql_t, tcontext: admin_home_t}]
+
+  # Negative control for the post-policy window: after the policy, flip a boolean
+  # and make sure the report (window = since policy marker) DOES see it.
+  # The port is already http_port_t, so this must classify as policy, not port.
+  chaos_boolean_off:
+    web01:
+      verdict: "NO"
+      must_find: [{fix: policy, scontext: httpd_t, tcontext: http_port_t}]

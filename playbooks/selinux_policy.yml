@@ -1,0 +1,8 @@
+---
+# PHASE 2 - Apply declared fcontext / port / boolean / module policy. Mode is NOT changed.
+# Always preview first:
+#   ansible-playbook playbooks/selinux_policy.yml --check --diff
+#   ansible-playbook playbooks/selinux_policy.yml
+- name: Apply SELinux policy customisations
+  hosts: "{{ target | default('selinux_managed') }}"
+  roles: [selinux_policy]

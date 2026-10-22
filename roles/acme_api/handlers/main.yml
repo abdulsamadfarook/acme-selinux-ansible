@@ -1,0 +1,6 @@
+---
+- name: Restart acme-api
+  ansible.builtin.systemd_service:
+    name: acme-api
+    state: restarted
+    daemon_reload: true

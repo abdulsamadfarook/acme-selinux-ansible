@@ -1,0 +1,99 @@
+---
+# PostgreSQL with a non-standard data dir, port, log dir and socket dir.
+# No SELinux tasks here on purpose: this is how the app team deploys today.
+- name: Install PostgreSQL
+  ansible.builtin.dnf:
+    name: [postgresql-server, postgresql]
+    state: present
+
+- name: Create custom data and log directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: postgres
+    group: postgres
+    mode: "0700"
+  loop: ["{{ acme_db_data_dir }}", "{{ acme_db_log_dir }}"]
+
+- name: Create systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/postgresql.service.d
+    state: directory
+    mode: "0755"
+
+- name: Point the service at the custom PGDATA, port and socket dir
+  ansible.builtin.template:
+    src: override.conf.j2
+    dest: /etc/systemd/system/postgresql.service.d/override.conf
+    mode: "0644"
+  notify: Restart postgresql
+  register: acme_db_unit
+
+- name: Reload systemd  # noqa: no-handler - must happen before initdb, not at end of play
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: acme_db_unit is changed
+
+- name: Initialise the cluster in the custom data dir
+  ansible.builtin.command: postgresql-setup --initdb
+  args:
+    creates: "{{ acme_db_data_dir }}/PG_VERSION"
+
+- name: Configure postgresql.conf
+  ansible.builtin.lineinfile:
+    path: "{{ acme_db_data_dir }}/postgresql.conf"
+    regexp: "^#?{{ item.key }} ="
+    line: "{{ item.key }} = {{ item.value }}"
+  loop:
+    - {key: listen_addresses, value: "'*'"}
+    - {key: port, value: "{{ acme_db_port }}"}
+    - {key: unix_socket_directories, value: "'{{ acme_db_socket_dir }}'"}
+    - {key: log_directory, value: "'{{ acme_db_log_dir }}'"}
+    - {key: logging_collector, value: "on"}
+    - {key: password_encryption, value: "scram-sha-256"}
+  notify: Restart postgresql
+
+- name: Allow the app tier to connect
+  ansible.builtin.lineinfile:
+    path: "{{ acme_db_data_dir }}/pg_hba.conf"
+    line: "host {{ acme_db_name }} {{ acme_db_user }} {{ acme_api_host }}/32 scram-sha-256"
+  notify: Restart postgresql
+
+- name: Open the DB port
+  ansible.posix.firewalld:
+    port: "{{ acme_db_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  when: acme_manage_firewall | bool
+
+- name: Start PostgreSQL
+  ansible.builtin.systemd_service:
+    name: postgresql
+    state: started
+    enabled: true
+
+- name: Flush handlers so the custom port/socket are live before seeding
+  ansible.builtin.meta: flush_handlers
+
+- name: Seed role, database and demo data
+  ansible.builtin.shell: |
+    set -e
+    PSQL="psql -h {{ acme_db_socket_dir }} -p {{ acme_db_port }} -v ON_ERROR_STOP=1 -tAq"
+    changed=0
+    if [ -z "$($PSQL -c "select 1 from pg_roles where rolname='{{ acme_db_user }}'")" ]; then
+      $PSQL -c "create role {{ acme_db_user }} login password '{{ acme_db_password }}'"; changed=1
+    fi
+    if [ -z "$($PSQL -c "select 1 from pg_database where datname='{{ acme_db_name }}'")" ]; then
+      $PSQL -c "create database {{ acme_db_name }} owner {{ acme_db_user }}"
+      $PSQL -d {{ acme_db_name }} -c "
+        create table accounts (id serial primary key, owner text, balance numeric(12,2));
+        insert into accounts (owner, balance) values ('alice', 1500.00), ('bob', 230.10), ('carol', 98000.00);
+        alter table accounts owner to {{ acme_db_user }};"
+      changed=1
+    fi
+    echo "changed=$changed"
+  become: true
+  become_user: postgres
+  register: acme_db_seed
+  changed_when: "'changed=1' in acme_db_seed.stdout"

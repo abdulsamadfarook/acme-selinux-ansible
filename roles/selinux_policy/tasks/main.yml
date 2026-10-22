@@ -1,0 +1,195 @@
+---
+# Applies a host's declared SELinux policy customisations.
+#   order matters: modules (define new types) -> fcontext -> relabel -> ports -> booleans
+# Fully idempotent and check-mode safe: run with --check --diff to preview.
+
+- name: Ensure SELinux management tooling is present
+  ansible.builtin.dnf:
+    name:
+      - policycoreutils-python-utils   # semanage
+      - python3-libsemanage            # used by sefcontext/seport/seboolean
+      - python3-policycoreutils
+      - selinux-policy-devel           # Makefile for building .te modules
+      - setroubleshoot-server          # sealert
+    state: present
+
+- name: Fail fast if SELinux is disabled (needs the relabel/reboot path instead)
+  ansible.builtin.assert:
+    that: ansible_facts.selinux.status == 'enabled'
+    fail_msg: >-
+      SELinux is disabled on {{ inventory_hostname }}. Run playbooks/selinux_from_disabled.yml first:
+      a disabled host must be relabelled and rebooted into permissive before any policy work.
+
+- name: State directory for markers and module builds
+  ansible.builtin.file:
+    path: "{{ selinux_policy_marker | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Custom policy modules
+  ansible.builtin.include_tasks: modules.yml
+  loop: "{{ selinux_modules }}"
+  loop_control:
+    loop_var: selinux_module
+    label: "{{ selinux_module.name }}"
+
+# --- file contexts -----------------------------------------------------------
+- name: File context rules (semanage fcontext)
+  community.general.sefcontext:
+    target: "{{ item.target }}"
+    setype: "{{ item.setype }}"
+    ftype: "{{ item.ftype | default('a') }}"
+    state: "{{ item.state | default('present') }}"
+  loop: "{{ selinux_fcontexts }}"
+  loop_control:
+    label: "{{ item.target }} -> {{ item.setype }}"
+
+# restorecon is what actually changes labels on disk.
+# In check mode the fcontext rules above were NOT really added, so "restorecon -n"
+# would preview against the OLD policy. Instead we list every file whose current
+# type differs from the declared one = exactly what the real run will relabel.
+# noqa: no pipefail on purpose - "head" exits early and pipefail would turn the
+# resulting SIGPIPE in find into a task failure whenever >25 files differ
+- name: Preview relabel (check mode)  # noqa: risky-shell-pipe
+  ansible.builtin.shell: >-
+    [ -e {{ item.path }} ] || exit 0;
+    find {{ item.path }} ! -context '*:{{ item.setype }}:*'
+    -printf 'Would relabel %p  %Z -> {{ item.setype }}\n' | head -n 25
+  loop: "{{ selinux_fcontexts }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: selinux_relabel_preview
+  check_mode: false
+  changed_when: selinux_relabel_preview.stdout | length > 0
+  when: ansible_check_mode
+
+- name: Show relabel preview
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ selinux_relabel_preview.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.path | default('') }}"
+  when: ansible_check_mode and item.stdout | default('') | length > 0
+
+- name: Relabel managed paths (restorecon)
+  ansible.builtin.command:
+    cmd: "restorecon -R -v {{ item }}"
+  loop: "{{ (selinux_fcontexts | map(attribute='path') | list + selinux_restorecon_paths) | unique }}"
+  register: selinux_restorecon
+  changed_when: selinux_restorecon.stdout | length > 0
+  failed_when: selinux_restorecon.rc != 0 and 'No such file' not in selinux_restorecon.stderr
+  when: not ansible_check_mode
+
+- name: Show what restorecon relabelled
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ selinux_restorecon.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - not ansible_check_mode
+    - item.stdout | default('') | length > 0
+
+# --- ports -------------------------------------------------------------------
+- name: Port type definitions (semanage port)
+  community.general.seport:
+    ports: "{{ item.ports }}"
+    proto: "{{ item.proto | default('tcp') }}"
+    setype: "{{ item.setype }}"
+    state: "{{ item.state | default('present') }}"
+  loop: "{{ selinux_ports }}"
+  loop_control:
+    label: "{{ item.proto | default('tcp') }}/{{ item.ports }} -> {{ item.setype }}"
+
+# --- booleans ----------------------------------------------------------------
+- name: Booleans (setsebool -P)
+  ansible.posix.seboolean:
+    name: "{{ item.name }}"
+    state: "{{ item.state }}"
+    persistent: true
+  loop: "{{ selinux_booleans }}"
+  loop_control:
+    label: "{{ item.name }}={{ item.state }}"
+
+# A running process keeps its old domain until it is re-executed, so services
+# confined by a (re)loaded module are restarted here - AFTER port labels and
+# booleans exist. Restarting straight after semodule -i would start the service
+# before e.g. its port is labelled: a denial under enforcing (found in the lab).
+- name: Restart services confined by a reloaded module
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: restarted
+  loop: "{{ selinux_restart_queue | default([]) | unique }}"
+
+# ansible.posix.seboolean with persistent: true compares ONLY the persistent store
+# (verified in the ansible.posix 2.2.2 source). A runtime-only flip - "setsebool x off"
+# without -P - is invisible to it and would stay broken until the next reboot (found
+# in the lab drift test). This second pass enforces the RUNTIME value as well.
+- name: Booleans - runtime value (setsebool)
+  ansible.posix.seboolean:
+    name: "{{ item.name }}"
+    state: "{{ item.state }}"
+    persistent: false
+  loop: "{{ selinux_booleans }}"
+  loop_control:
+    label: "{{ item.name }}={{ item.state }} (runtime)"
+
+# --- per-domain permissive ---------------------------------------------------
+# Lets ONE new domain (e.g. acme_api_t) run permissive while the host is enforcing.
+# Only domains this role added are ever removed (tracked in a state file); vendor
+# entries such as rhcd_t are left alone and merely reported by the drift role.
+- name: Permissive domains (semanage permissive)
+  community.general.selinux_permissive:
+    name: "{{ item }}"
+    permissive: true
+  loop: "{{ selinux_permissive_domains }}"
+
+- name: Domains this role made permissive previously
+  ansible.builtin.slurp:
+    src: "{{ selinux_policy_marker | dirname }}/permissive_managed.json"
+  register: selinux_permissive_state
+  failed_when: false
+
+- name: Remove permissive domains we added that are no longer declared
+  community.general.selinux_permissive:
+    name: "{{ item }}"
+    permissive: false
+  loop: >-
+    {{ ((selinux_permissive_state.content | default('W10=') | b64decode | from_json)
+        | difference(selinux_permissive_domains)) }}
+
+- name: Remember which domains we manage
+  ansible.builtin.copy:
+    dest: "{{ selinux_policy_marker | dirname }}/permissive_managed.json"
+    content: "{{ selinux_permissive_domains | to_json }}\n"
+    mode: "0644"
+
+# The enforcement gate counts denials since the CURRENT policy went live. The marker
+# only moves when the declared policy changes, so re-running this role (e.g. as a
+# drift check) does not reset the observation window.
+- name: Read policy marker
+  ansible.builtin.slurp:
+    src: "{{ selinux_policy_marker }}"
+  register: selinux_marker_raw
+  failed_when: false
+
+# Time comes from the TARGET's clock: AVC timestamps are written by the target's
+# kernel, so comparing them with controller time breaks the moment clocks differ
+# (found in the lab: guests 4 h behind after a snapshot revert -> gate always 0).
+- name: Host clock (epoch)
+  ansible.builtin.command: date +%s
+  register: selinux_policy_host_now
+  changed_when: false
+  check_mode: false
+
+- name: Record when this version of the policy was applied
+  ansible.builtin.copy:
+    dest: "{{ selinux_policy_marker }}"
+    content: "{{ {'fingerprint': selinux_policy_fingerprint, 'applied_at': selinux_policy_host_now.stdout | int} | to_json }}\n"
+    mode: "0644"
+  when:
+    - not ansible_check_mode
+    - selinux_marker_raw.content is not defined or
+      (selinux_marker_raw.content | b64decode | from_json).fingerprint != selinux_policy_fingerprint or
+      selinux_module_reloaded | default(false) or
+      selinux_policy_reset_window | bool

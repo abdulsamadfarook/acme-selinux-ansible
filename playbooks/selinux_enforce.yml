@@ -1,0 +1,14 @@
+---
+# PHASE 3 - Rolling switch to enforcing.
+#   batch 1 = a single canary host, then 50 %, then the rest
+#   max_fail_percentage 0 = any rollback stops every later batch
+# At 1,200 hosts you would pass e.g. -e '{"selinux_serial": [1, "2%", "10%", "25%", "100%"]}'
+- name: Enforce SELinux (canary, gate, soak, auto-rollback)
+  hosts: "{{ target | default('selinux_managed') }}"
+  serial: "{{ selinux_serial | default([1, '50%', '100%']) }}"
+  max_fail_percentage: 0
+  order: inventory
+  roles: [selinux_enforce]
+
+- name: End-to-end check after the rollout
+  ansible.builtin.import_playbook: smoke_test.yml

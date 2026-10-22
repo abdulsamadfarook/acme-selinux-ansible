@@ -1,0 +1,117 @@
+---
+# Plays the panel's role: inject a realistic SELinux-related failure.
+#   ansible-playbook playbooks/chaos.yml -e scenario=<name>
+#
+# scenario      host   what happens                                  native diagnosis                      proper fix (via Ansible)
+# ------------  -----  --------------------------------------------  ------------------------------------  ---------------------------------------------
+# new_port      web01  httpd moved to port 8091 -> fails to start    ausearch --input-logs -m AVC -c httpd  add 8091 to selinux_ports (web) -> policy play
+# mislabel      web01  page created in /tmp and mv'd into docroot   ausearch -c httpd (read user_tmp_t)   policy play (restorecon on managed paths)
+# boolean_off   web01  setsebool httpd_can_network_relay off -> 503 ausearch -c httpd (name_connect)      drift play (re-asserts boolean)
+# setenforce0   all    an admin runs setenforce 0                    getenforce / ausearch --input-logs -m MAC_STATUS   drift play / EDA
+# app_logdir    app01  app team moves logs to /srv/acme/applogs      ausearch -c acme-api (write default_t)  add fcontext for new dir (app) -> policy play
+# db_datadir    db01   DBA restores PGDATA from a tarball in /root   ausearch -c postgres                  policy play (restorecon)
+#
+# Undo app-side changes afterwards with: ansible-playbook playbooks/acme_deploy.yml
+- name: Inject a fault
+  hosts: selinux_managed
+  vars:
+    chaos_hosts:
+      new_port: web
+      mislabel: web
+      boolean_off: web
+      setenforce0: selinux_managed
+      app_logdir: app
+      db_datadir: db
+  tasks:
+    - name: Validate scenario
+      ansible.builtin.assert:
+        that: scenario in chaos_hosts
+        fail_msg: "scenario must be one of {{ chaos_hosts.keys() | list }}"
+      run_once: true  # noqa: run-once[task] - validation only
+
+    - name: Only act on the hosts this scenario targets
+      ansible.builtin.meta: end_host
+      when: inventory_hostname not in groups[chaos_hosts[scenario]]
+
+    - name: "Scenario new_port: move the vhost to an unlabelled port"
+      when: scenario == 'new_port'
+      block:
+        - name: Edit vhost to 8091
+          ansible.builtin.replace:
+            path: /etc/httpd/conf.d/acme.conf
+            regexp: '\b{{ acme_web_port }}\b'
+            replace: '8091'
+        - name: Open 8091
+          ansible.posix.firewalld:
+            port: 8091/tcp
+            permanent: true
+            immediate: true
+            state: enabled
+          when: acme_manage_firewall | bool
+        - name: Restart httpd (expected to FAIL under enforcing)
+          ansible.builtin.systemd_service:
+            name: httpd
+            state: restarted
+          register: chaos_restart
+          failed_when: false   # the failure IS the scenario
+
+    - name: "Scenario mislabel: mv keeps the source label"
+      when: scenario == 'mislabel'
+      ansible.builtin.shell: |
+        echo '<h1>Quarterly statement</h1>' > /tmp/statement.html
+        mv /tmp/statement.html {{ acme_web_root }}/statement.html
+        chmod 644 {{ acme_web_root }}/statement.html
+        ls -Z {{ acme_web_root }}/statement.html
+      changed_when: true
+
+    - name: "Scenario boolean_off: runtime-only boolean flip"
+      when: scenario == 'boolean_off'
+      ansible.builtin.command: setsebool httpd_can_network_relay off
+      changed_when: true
+
+    - name: "Scenario setenforce0: the classic"
+      when: scenario == 'setenforce0'
+      ansible.builtin.command: setenforce 0
+      changed_when: true
+
+    - name: "Scenario app_logdir: app team changes the log directory"
+      when: scenario == 'app_logdir'
+      block:
+        - name: New log dir
+          ansible.builtin.file:
+            path: /srv/acme/applogs
+            state: directory
+            owner: acme
+            group: acme
+            mode: "0750"
+        - name: Point config at it
+          ansible.builtin.replace:
+            path: /etc/acme/api.json
+            regexp: '"log_dir": "[^"]*"'
+            replace: '"log_dir": "/srv/acme/applogs"'
+        - name: Restart acme-api (expected to FAIL under enforcing)
+          ansible.builtin.systemd_service:
+            name: acme-api
+            state: restarted
+          register: chaos_restart
+          failed_when: false   # the failure IS the scenario
+
+    - name: "Scenario db_datadir: restore PGDATA from a backup tarball (labels from /root)"
+      when: scenario == 'db_datadir'
+      ansible.builtin.shell: |
+        set -e
+        systemctl stop postgresql
+        tar -C {{ acme_db_data_dir | dirname }} -cf /root/pgsql-backup.tar {{ acme_db_data_dir | basename }}
+        mv {{ acme_db_data_dir }} {{ acme_db_data_dir }}.old
+        mkdir -p /root/restore && tar -C /root/restore -xf /root/pgsql-backup.tar
+        mv /root/restore/{{ acme_db_data_dir | basename }} {{ acme_db_data_dir }}
+        rm -rf {{ acme_db_data_dir }}.old /root/restore
+        systemctl start postgresql || true
+        ls -dZ {{ acme_db_data_dir }}
+      changed_when: true
+
+    - name: Now go and find it
+      ansible.builtin.debug:
+        msg: >-
+          Fault '{{ scenario }}' injected. Start with:
+          sudo ausearch --input-logs -m AVC,USER_AVC -ts recent -i  |  sudo sealert -a /var/log/audit/audit.log

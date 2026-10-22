@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+[Unit]
+Description=ACME accounts API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=acme
+Group=acme
+Environment=ACME_API_CONFIG=/etc/acme/api.json
+ExecStart=/opt/acme/api/acme-api
+RuntimeDirectory={{ acme_api_run_dir | basename }}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

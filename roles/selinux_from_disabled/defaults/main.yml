@@ -1,0 +1,3 @@
+---
+# A full relabel touches every inode: allow plenty of time on big filesystems
+selinux_relabel_reboot_timeout: 3600

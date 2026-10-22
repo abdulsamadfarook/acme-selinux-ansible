@@ -1,0 +1,7 @@
+---
+selinux_fcontexts: []
+selinux_ports: []
+selinux_booleans: []
+acme_health_checks:
+  # "/" is the RHEL welcome page, which answers 403 by design - check real content
+  - {name: "legacy content", url: "http://127.0.0.1:80/hosts.txt"}

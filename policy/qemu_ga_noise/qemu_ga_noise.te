@@ -1,0 +1,27 @@
+policy_module(qemu_ga_noise, 1.0.0)
+
+########################################
+# The OpenShift Virtualization guest agent (qemu-ga, virt_qemu_ga_t) collects
+# filesystem info every few minutes and walks into podman's container storage
+# (container_var_lib_t). It does not need that: the call fails and qemu-ga
+# carries on. But every attempt is logged as an AVC, and our enforcement gate
+# and soak count AVCs, so this platform noise would block the ACME rollout.
+#
+# dontaudit = keep DENYING it, just do not log it. Nothing gets more access.
+# Rejected alternatives:
+#   boolean virt_qemu_ga_read_nonsecurity_files - lets qemu-ga read almost
+#     every file on the system, far broader than the problem
+#   allow rule - grants access qemu-ga does not need
+#
+# optional_policy: compiles and loads on hosts without container-selinux too
+# (the rules only become active where those types exist).
+
+optional_policy(`
+	gen_require(`
+		type virt_qemu_ga_t;
+		type container_var_lib_t;
+		type container_ro_file_t;
+	')
+
+	dontaudit virt_qemu_ga_t { container_var_lib_t container_ro_file_t }:dir search_dir_perms;
+')

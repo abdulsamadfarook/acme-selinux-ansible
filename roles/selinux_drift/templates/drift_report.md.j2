@@ -1,0 +1,20 @@
+# SELinux drift report
+
+Generated {{ now().strftime('%Y-%m-%d %H:%M:%S') }} · remediate={{ selinux_drift_remediate }} · check_mode={{ ansible_check_mode }}
+
+Mode drift is only checked on **migrated** hosts (passed the enforce gate). A host that is
+not migrated yet is expected to be permissive: switching it would skip the gate.
+
+| Host | Migrated | Runtime | Config | Mode drift | Declared boolean drift | Undeclared booleans | Permissive domains |
+|---|---|---|---|---|---|---|---|
+{% for h in ansible_play_hosts %}{% set d = hostvars[h].selinux_drift %}
+| {{ h }} | {{ 'yes' if d.migrated | bool else 'not yet' }} | {{ d.runtime }} | {{ d.config }} | {{ 'YES' if d.mode_drift | bool else ('no' if d.migrated | bool else 'n/a') }} | {{ d.boolean_drift | join('<br>') or '-' }} | {{ d.rogue_booleans | join(', ') or '-' }} | {{ d.permissive_domains | join(', ') or '-' }} |
+{% endfor %}
+
+{% for h in ansible_play_hosts if hostvars[h].selinux_drift.recent_changes %}
+## {{ h }} - SELinux state changes today (from auditd; auid = the human login behind sudo)
+
+```
+{{ hostvars[h].selinux_drift.recent_changes | join('\n') }}
+```
+{% endfor %}

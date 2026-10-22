@@ -1,0 +1,87 @@
+---
+# SELINUX=disabled -> permissive, the safe way.
+#
+# Why not straight to enforcing? While SELinux was disabled nothing labelled new
+# files: they are unlabeled_t. Booting enforcing on that filesystem can stop
+# systemd/init from executing its own binaries -> boot failure / kernel panic.
+# So: permissive + full relabel on next boot; enforcing comes later through the
+# normal audit -> gate -> enforce workflow.
+#
+# RHEL 9 note: the supported way to disable SELinux is the kernel argument
+# selinux=0. SELINUX=disabled in /etc/selinux/config alone no longer prevents
+# the LSM from initialising. We therefore clean up BOTH places.
+
+- name: Inspect current state
+  ansible.builtin.shell: |
+    set -o pipefail
+    echo "runtime=$(getenforce)"
+    echo "config=$(awk -F= '/^SELINUX=/{print $2}' /etc/selinux/config)"
+    # not "grep -q": with pipefail, grep -q exits early, grubby gets SIGPIPE and the
+    # pipeline "fails" -> karg=none -> selinux=0 survives (found in the lab)
+    grubby --info=ALL | grep -E '^args=.*selinux=0' >/dev/null && echo "karg=selinux=0" || echo "karg=none"
+  register: selinux_fd_state
+  changed_when: false
+  check_mode: false
+
+- name: Parse state
+  ansible.builtin.set_fact:
+    selinux_fd: "{{ dict(selinux_fd_state.stdout_lines | map('split', '=', 1)) }}"
+
+- name: Report
+  ansible.builtin.debug:
+    var: selinux_fd
+
+- name: Convert to permissive with relabel
+  when: selinux_fd.runtime == 'Disabled'
+  block:
+    - name: Remove selinux=0 / enforcing=0 from every boot entry
+      ansible.builtin.command: grubby --update-kernel=ALL --remove-args="selinux enforcing"
+      when: selinux_fd.karg != 'none'
+      changed_when: true
+
+    - name: Configure PERMISSIVE (never enforcing straight from disabled)
+      ansible.builtin.lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: SELINUX=permissive
+
+    - name: Schedule a full filesystem relabel on next boot
+      ansible.builtin.command: fixfiles -F onboot   # creates /.autorelabel
+      changed_when: true
+
+    - name: Reboot (relabel runs early in boot, then the host reboots again)
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ selinux_relabel_reboot_timeout }}"
+        msg: "Ansible: SELinux relabel"
+
+- name: Verify
+  when: not ansible_check_mode
+  block:
+    - name: Mode after relabel
+      ansible.builtin.command: getenforce
+      register: selinux_fd_after
+      changed_when: false
+      failed_when: selinux_fd_after.stdout not in ['Permissive', 'Enforcing']
+
+    - name: Relabel finished (/.autorelabel consumed)
+      ansible.builtin.stat:
+        path: /.autorelabel
+      register: selinux_fd_flag
+      failed_when: selinux_fd_flag.stat.exists
+
+    - name: Spot-check core labels
+      ansible.builtin.command: matchpathcon -V /etc/passwd /etc/shadow /usr/bin/bash /var/log/messages
+      changed_when: false
+
+    - name: Count unlabeled files left on the root filesystem
+      ansible.builtin.shell: set -o pipefail; find / -xdev -context '*:unlabeled_t:*' 2>/dev/null | wc -l
+      register: selinux_fd_unlabeled
+      changed_when: false
+      failed_when: selinux_fd_unlabeled.stdout | int > 0
+
+    - name: Next step
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is {{ selinux_fd_after.stdout }} with a clean relabel.
+          Now collect AVCs under real traffic (selinux_audit.yml), then go through
+          selinux_policy.yml and selinux_enforce.yml like every other host.

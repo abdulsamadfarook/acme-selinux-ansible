@@ -1,0 +1,16 @@
+---
+selinux_fcontexts:
+  - {target: '/data/acme/htdocs(/.*)?', setype: httpd_sys_content_t, path: /data/acme/htdocs}
+  - {target: '/data/acme/weblogs(/.*)?', setype: httpd_log_t, path: /data/acme/weblogs}
+selinux_ports:
+  - {ports: "{{ acme_web_port }}", proto: tcp, setype: http_port_t}   # httpd must BIND here
+  - {ports: "{{ acme_api_port }}", proto: tcp, setype: http_port_t}   # httpd must CONNECT here (reverse proxy)
+
+selinux_booleans:
+  # Narrow: lets httpd connect to http_port_t-type ports only.
+  # NOT httpd_can_network_connect, which would allow httpd to connect to ANY port.
+  - {name: httpd_can_network_relay, state: true}
+
+acme_health_checks:
+  - {name: "static page", url: "http://127.0.0.1:{{ acme_web_port }}/"}
+  - {name: "proxied API (web -> app -> db)", url: "http://127.0.0.1:{{ acme_web_port }}/api/health"}

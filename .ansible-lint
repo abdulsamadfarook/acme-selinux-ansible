@@ -1,0 +1,8 @@
+---
+# selinux_* variables are deliberately shared between roles (policy, enforce, drift,
+# audit all read the same declared state), so the per-role prefix rule does not fit.
+skip_list:
+  - var-naming[no-role-prefix]
+exclude_paths:
+  - .venv/
+  - collections/

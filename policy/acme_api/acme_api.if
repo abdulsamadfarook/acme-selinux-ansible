@@ -1,0 +1,17 @@
+## <summary>ACME accounts API (acme-api)</summary>
+
+########################################
+## <summary>
+##	Read acme-api log files (e.g. for a log shipper domain).
+## </summary>
+## <param name="domain">
+##	<summary>Domain allowed access.</summary>
+## </param>
+#
+interface(`acme_api_read_log',`
+	gen_require(`
+		type acme_api_log_t;
+	')
+	logging_search_logs($1)
+	read_files_pattern($1, acme_api_log_t, acme_api_log_t)
+')

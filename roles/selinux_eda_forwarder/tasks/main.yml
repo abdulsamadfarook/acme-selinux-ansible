@@ -1,0 +1,40 @@
+---
+- name: Dependencies
+  ansible.builtin.dnf:
+    name: [jq, curl]
+    state: present
+
+- name: Forwarder script
+  ansible.builtin.template:
+    src: selinux-eda-forwarder.sh.j2
+    dest: /usr/local/sbin/selinux-eda-forwarder
+    mode: "0750"
+  notify: Restart forwarder
+
+# Root-only curl config, so the credential never appears in the script, the unit
+# or ps. Sent as a ready-made Basic header: base64 has no quotes or backslashes,
+# so any password works without escaping.
+- name: Forwarder credentials (curl config)
+  ansible.builtin.copy:
+    dest: /etc/selinux-eda-forwarder.curl
+    content: |
+      {% if selinux_eda_user | length > 0 %}
+      header = "Authorization: Basic {{ (selinux_eda_user ~ ':' ~ selinux_eda_password) | b64encode }}"
+      {% endif %}
+    mode: "0600"
+  no_log: true
+  notify: Restart forwarder
+
+- name: Forwarder unit
+  ansible.builtin.template:
+    src: selinux-eda-forwarder.service.j2
+    dest: /etc/systemd/system/selinux-eda-forwarder.service
+    mode: "0644"
+  notify: Restart forwarder
+
+- name: Enable forwarder
+  ansible.builtin.systemd_service:
+    name: selinux-eda-forwarder
+    state: started
+    enabled: true
+    daemon_reload: true

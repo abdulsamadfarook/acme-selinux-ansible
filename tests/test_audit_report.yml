@@ -1,0 +1,87 @@
+---
+# Evaluates the audit report against ground truth - so the discovery slide is
+# backed by evidence, not by eyeballing one run.
+#   ansible-playbook tests/test_audit_report.yml -e case=baseline
+# Checks per host:
+#   1. completeness  - report total == an independent raw count of the same window
+#   2. recall        - every expected root cause is present
+#   3. precision     - post-fix cases report no root causes
+#   4. verdict       - including REVIEW (unconfined) and NOT ASSESSABLE (disabled)
+- name: Evaluate the SELinux audit report
+  hosts: "{{ (lookup('file', 'audit_expectations.yml') | from_yaml).audit_eval_cases[case | default('baseline')].keys() | join(',') }}"
+  vars_files: [audit_expectations.yml]
+  vars:
+    exp: "{{ audit_eval_cases[case][inventory_hostname] }}"
+  tasks:
+    - name: Run the audit role exactly as production would
+      ansible.builtin.include_role:
+        name: selinux_audit
+
+    - name: Independent raw count of denial records in the same window
+      ansible.builtin.shell: >-
+        set -o pipefail;
+        LC_ALL=C ausearch --input-logs -m AVC,USER_AVC -ts {{ selinux_audit_result.window }} -te {{ selinux_audit_result.window_end }} --raw 2>/dev/null
+        | grep -c 'avc: *denied' || true
+      register: raw_count
+      changed_when: false
+
+    - name: Found root causes
+      ansible.builtin.set_fact:
+        found: >-
+          {{ selinux_audit_result.summary.root_causes
+             | map('dict2items') | map('selectattr', 'key', 'in', ['fix', 'scontext', 'tcontext', 'port'])
+             | map('items2dict') | list }}
+
+    - name: Evaluate
+      ansible.builtin.set_fact:
+        checks:
+          completeness: "{{ selinux_audit_result.summary.total | int == raw_count.stdout | int }}"
+          verdict: "{{ selinux_audit_result.verdict == exp.verdict }}"
+          precision: "{{ exp.max_root_causes is not defined or found | length <= exp.max_root_causes }}"
+          unconfined_ok: >-
+            {{ (exp.must_be_unconfined | default([]) | difference(selinux_audit_result.unconfined) | length == 0) and
+               (exp.must_not_be_unconfined | default([]) | intersect(selinux_audit_result.unconfined) | length == 0) }}
+
+    - name: Recall - which expected root causes were not found
+      ansible.builtin.set_fact:
+        missing: >-
+          {%- set out = [] -%}
+          {%- for e in exp.must_find | default([]) -%}
+          {%-   set hit = found | selectattr('fix', 'equalto', e.fix) | selectattr('scontext', 'equalto', e.scontext)
+                               | selectattr('tcontext', 'equalto', e.tcontext) | list -%}
+          {%-   if e.port is defined -%}{%- set hit = hit | selectattr('port', 'equalto', e.port) | list -%}{%- endif -%}
+          {%-   if not hit -%}{%- set _ = out.append(e) -%}{%- endif -%}
+          {%- endfor -%}{{ out }}
+
+    - name: Result
+      ansible.builtin.debug:
+        msg:
+          - "case={{ case }} verdict={{ selinux_audit_result.verdict }} (expected {{ exp.verdict }})"
+          - "records: report={{ selinux_audit_result.summary.total }} raw={{ raw_count.stdout }}"
+          - "root causes found: {{ found }}"
+          - "missing: {{ missing }}"
+          - "unconfined: {{ selinux_audit_result.unconfined }}"
+
+    - name: Assert
+      ansible.builtin.assert:
+        that:
+          - checks.completeness | bool
+          - checks.verdict | bool
+          - missing | length == 0
+          - checks.precision | bool
+          - checks.unconfined_ok | bool
+        fail_msg: "Audit report evaluation FAILED for {{ inventory_hostname }} ({{ case }}): {{ checks }} missing={{ missing }}"
+        success_msg: "Audit report evaluation passed for {{ inventory_hostname }} ({{ case }})"
+
+    - name: Append to the evaluation log
+      ansible.builtin.lineinfile:
+        path: "{{ selinux_report_dir }}/audit_eval.log"
+        line: >-
+          {{ now().strftime('%Y-%m-%d %H:%M:%S') }} case={{ case }} host={{ inventory_hostname }}
+          verdict={{ selinux_audit_result.verdict }} records={{ selinux_audit_result.summary.total }}/raw={{ raw_count.stdout }}
+          root_causes={{ found | length }} missing={{ missing | length }} PASS
+        create: true
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      throttle: 1

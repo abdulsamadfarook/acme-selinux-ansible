@@ -1,0 +1,4 @@
+---
+selinux_policy_marker: /var/lib/acme-selinux/policy_applied
+# Set true only to skip the AVC gate on purpose (recorded in the job log)
+selinux_gate_override: false
