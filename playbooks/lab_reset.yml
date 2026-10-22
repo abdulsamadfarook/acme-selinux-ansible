@@ -101,6 +101,15 @@
       changed_when: false
       check_mode: false
 
+    # A process still running in a module's domain becomes unlabeled_t when the module
+    # is removed, and its denials would land in the next baseline audit. Stop those
+    # services first; "Restart the app services" below starts them again.
+    - name: Stop services confined by the custom modules
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: stopped
+      loop: "{{ selinux_modules | default([]) | map(attribute='restart', default=[]) | flatten | unique }}"
+
     - name: Remove custom policy modules
       ansible.builtin.command: semodule -r {{ item.name }}
       loop: "{{ selinux_modules | default([]) }}"
